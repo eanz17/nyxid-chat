@@ -906,10 +906,25 @@ summary:focus-visible {
   padding: 10px;
 }
 
+.authorization-callout.granted,
+.authorization-callout.retried {
+  border-color: color-mix(in srgb, var(--success) 34%, transparent);
+  background: var(--success-soft);
+}
+
 .authorization-callout > svg {
   width: 17px;
   height: 17px;
   color: var(--warning);
+}
+
+.authorization-callout.granted > svg,
+.authorization-callout.retried > svg {
+  color: var(--success);
+}
+
+.authorization-callout-content {
+  min-width: 0;
 }
 
 .authorization-callout-copy {
@@ -927,6 +942,84 @@ summary:focus-visible {
   color: var(--muted);
   font-size: 10px;
   overflow-wrap: anywhere;
+}
+
+.authorization-service-summary {
+  display: grid;
+  min-height: 28px;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  margin-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--border-strong) 70%, transparent);
+  padding-top: 7px;
+}
+
+.authorization-service-icon {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  color: var(--warning);
+}
+
+.authorization-service-icon svg {
+  width: 13px;
+  height: 13px;
+}
+
+.authorization-service-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.authorization-service-copy strong,
+.authorization-service-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.authorization-service-copy strong {
+  color: var(--text-soft);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.authorization-service-copy small,
+.authorization-service-summary em {
+  color: var(--tertiary);
+  font-family: var(--mono);
+  font-size: 8.5px;
+  font-style: normal;
+}
+
+.authorization-service-summary em.granted {
+  color: var(--success);
+}
+
+.authorization-callout-actions {
+  display: flex;
+  grid-column: 3;
+  align-items: center;
+  gap: 5px;
+}
+
+.authorization-manage-button {
+  width: 28px;
+  height: 28px;
+  flex-basis: 28px;
+  border-color: transparent;
+}
+
+.authorization-manage-button svg {
+  width: 13px;
+  height: 13px;
+}
+
+.authorization-callout.checking .service-authorize-button svg {
+  animation: spin 1s linear infinite;
 }
 
 .activity-card {
@@ -1158,6 +1251,64 @@ summary:focus-visible {
   margin: 0 auto;
   padding: 20px 0 18px;
   background: linear-gradient(to bottom, transparent, var(--bg) 25%);
+}
+
+.composer-service-panel {
+  position: absolute;
+  bottom: calc(100% - 8px);
+  left: 0;
+  width: min(430px, 100%);
+  max-height: min(390px, calc(100dvh - 150px));
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--panel-raised);
+  box-shadow: var(--shadow);
+}
+
+.composer-service-header {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid var(--border);
+  padding: 7px 8px 7px 12px;
+}
+
+.composer-service-header > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.composer-service-header strong {
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.composer-service-header small {
+  color: var(--tertiary);
+  font-size: 9px;
+}
+
+.composer-service-header .icon-button {
+  width: 28px;
+  height: 28px;
+  flex-basis: 28px;
+  margin-left: auto;
+  border-color: transparent;
+}
+
+.composer-service-list {
+  max-height: min(330px, calc(100dvh - 200px));
+  overflow-y: auto;
+  padding: 0 10px;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.composer-service-list .service-access-row {
+  padding-right: 0;
+  padding-left: 0;
 }
 
 .composer {
@@ -2316,9 +2467,13 @@ summary:focus-visible {
     grid-template-columns: 20px minmax(0, 1fr);
   }
 
-  .authorization-callout .service-authorize-button {
+  .authorization-callout-actions {
     grid-column: 2;
-    width: fit-content;
+    justify-content: flex-start;
+  }
+
+  .composer-service-panel {
+    width: 100%;
   }
 }
 

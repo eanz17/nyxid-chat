@@ -9,9 +9,8 @@ import {
   safeJson,
 } from "./protocol.js";
 
-const PREFERENCES_KEY = "nyxid-chat:production-preferences:v3-oauth";
+const PREFERENCES_KEY = "nyxid-chat:production-preferences:v4-site-session";
 const THEME_KEY = "nyxid-chat-demo:theme";
-const CORE_AUTHORIZATION_ATTEMPT_KEY = "nyxid-chat:core-authorization-attempt:v1";
 const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 
 const surfaceLabels = {
@@ -25,7 +24,7 @@ const surfacePaths = {
 };
 
 const transportLabels = {
-  "nyxid-oauth": "Authorized via NyxID",
+  "nyxid-session": "NyxID site session",
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -37,11 +36,16 @@ const dom = {
   attachmentName: $("#attachmentName"),
   cancelSettingsButton: $("#cancelSettingsButton"),
   clearEventsButton: $("#clearEventsButton"),
+  closeComposerServicesButton: $("#closeComposerServicesButton"),
   closeInspectorButton: $("#closeInspectorButton"),
   closeSettingsButton: $("#closeSettingsButton"),
   commandFact: $("#commandFact"),
   commandFactRow: $("#commandFactRow"),
   composerForm: $("#composerForm"),
+  composerServiceCount: $("#composerServiceCount"),
+  composerServiceList: $("#composerServiceList"),
+  composerServicePanel: $("#composerServicePanel"),
+  composerServicesButton: $("#composerServicesButton"),
   composerStatus: $("#composerStatus"),
   connectionButton: $("#connectionButton"),
   connectionDot: $("#connectionDot"),
@@ -69,6 +73,7 @@ const dom = {
   openSettingsNav: $("#openSettingsNav"),
   promptInput: $("#promptInput"),
   quickActions: $("#quickActions"),
+  refreshComposerServicesButton: $("#refreshComposerServicesButton"),
   recentGroup: $("#recentGroup"),
   recentSessionsList: $("#recentSessionsList"),
   removeAttachmentButton: $("#removeAttachmentButton"),
@@ -84,6 +89,7 @@ const dom = {
   runStatus: $("#runStatus"),
   runTabButton: $("#runTabButton"),
   sendButton: $("#sendButton"),
+  serviceAccessDescription: $("#serviceAccessDescription"),
   serviceCount: $("#serviceCount"),
   serviceList: $("#serviceList"),
   servicesButton: $("#servicesButton"),
@@ -118,17 +124,19 @@ const dom = {
 
 const state = {
   config: {
-    transport: "nyxid-oauth",
+    transport: "nyxid-session",
+    authMode: "site-session",
     surface: "nyxid-chat",
     directBaseUrl: "https://aevatar-console-backend-api.aevatar.ai",
     proxyBaseUrl: "https://nyx-api.chrono-ai.fun/api/v1/proxy/s/aevatar",
     ornnWebUrl: "https://ornn.chrono-ai.fun",
+    nyxidWebUrl: "https://nyx.chrono-ai.fun",
+    servicesUrl: "https://nyx.chrono-ai.fun/keys",
     scopeId: "",
     workflow: "direct",
   },
   auth: { authenticated: false, user: null, resources: [] },
   services: [],
-  oauthPopup: null,
   sessionId: createId("session"),
   actorId: null,
   attachment: null,
@@ -169,8 +177,10 @@ function createRunState() {
     progressLabel: null,
     progressTimers: [],
     approvalCard: null,
+    authorizationCards: [],
     authorizationPrompted: false,
     eventSequence: 0,
+    request: null,
   };
 }
 
@@ -364,7 +374,7 @@ async function init() {
       ...remote,
       surface: storedSurface,
       workflow: storedWorkflow,
-      transport: "nyxid-oauth",
+      transport: remote.transport || "nyxid-session",
       scopeId: "",
     };
   } catch (error) {
@@ -398,6 +408,9 @@ function bindEvents() {
   dom.settingsButton.addEventListener("click", openSettings);
   dom.openSettingsNav.addEventListener("click", openSettings);
   dom.servicesButton.addEventListener("click", openSettings);
+  dom.composerServicesButton.addEventListener("click", toggleComposerServices);
+  dom.closeComposerServicesButton.addEventListener("click", closeComposerServices);
+  dom.refreshComposerServicesButton.addEventListener("click", () => void loadServices());
   dom.connectionButton.addEventListener("click", openSettings);
   dom.closeSettingsButton.addEventListener("click", closeSettings);
   dom.cancelSettingsButton.addEventListener("click", closeSettings);
@@ -407,10 +420,10 @@ function bindEvents() {
   });
   dom.testConnectionButton.addEventListener("click", () => {
     if (state.auth.authenticated) void checkConnection(readSettingsForm(), true);
-    else beginOAuth("/api/auth/login");
+    else beginLogin();
   });
-  dom.loginButton.addEventListener("click", () => beginOAuth("/api/auth/login"));
-  dom.emptyLoginButton.addEventListener("click", () => beginOAuth("/api/auth/login"));
+  dom.loginButton.addEventListener("click", beginLogin);
+  dom.emptyLoginButton.addEventListener("click", beginLogin);
   dom.logoutButton.addEventListener("click", () => void logout());
   dom.themeButton.addEventListener("click", toggleTheme);
   dom.attachButton.addEventListener("click", () => dom.fileInput.click());
@@ -426,7 +439,14 @@ function bindEvents() {
   document.querySelectorAll("[data-prompt]").forEach((button) => {
     button.addEventListener("click", () => void sendPrompt(button.dataset.prompt || ""));
   });
-  window.addEventListener("message", (event) => void handleOAuthMessage(event));
+  document.addEventListener("pointerdown", (event) => {
+    if (dom.composerServicePanel.classList.contains("hidden")) return;
+    if (dom.composerServicePanel.contains(event.target) || dom.composerServicesButton.contains(event.target)) return;
+    closeComposerServices();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeComposerServices();
+  });
   setInterval(updateElapsed, 1000);
 }
 
@@ -463,62 +483,29 @@ function writeStorage(key, value) {
   }
 }
 
-function readSessionStorage(key) {
-  try {
-    return sessionStorage.getItem(key);
-  } catch {
-    return null;
-  }
+function beginLogin() {
+  const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  const query = new URLSearchParams({ return_to: returnTo });
+  window.location.assign(`/api/auth/login?${query}`);
 }
 
-function writeSessionStorage(key, value) {
-  try {
-    sessionStorage.setItem(key, value);
-  } catch {
-    // A failed write only means the browser may ask again after a reload.
+function openServiceManagement(card = null) {
+  const target = state.config.servicesUrl || new URL("/keys", state.config.nyxidWebUrl).toString();
+  const opened = window.open(target, "nyxid-services");
+  if (opened) {
+    try {
+      opened.opener = null;
+    } catch {
+      // The external NyxID window may already be cross-origin.
+    }
+    opened.focus?.();
+  } else {
+    window.location.assign(target);
   }
-}
-
-function removeSessionStorage(key) {
-  try {
-    sessionStorage.removeItem(key);
-  } catch {
-    // Storage may be disabled.
-  }
-}
-
-function beginOAuth(path) {
-  const width = 560;
-  const height = 720;
-  const left = Math.max(0, Math.round(window.screenX + (window.outerWidth - width) / 2));
-  const top = Math.max(0, Math.round(window.screenY + (window.outerHeight - height) / 2));
-  const popup = window.open(
-    path,
-    "nyxid-oauth",
-    `popup=yes,width=${width},height=${height},left=${left},top=${top}`,
-  );
-  if (!popup) {
-    window.location.assign(path);
-    return;
-  }
-  state.oauthPopup = popup;
-  popup.focus();
-}
-
-async function handleOAuthMessage(event) {
-  if (event.origin !== window.location.origin || event.data?.type !== "nyxid-oauth") return;
-  state.oauthPopup?.close();
-  state.oauthPopup = null;
-  if (event.data.status !== "success") {
-    showToast(event.data.message || "NyxID 授权未完成。");
-    return;
-  }
-  await refreshAuthSession({ includeServices: true });
-  updateConfigUi();
-  if (state.auth.authenticated) {
-    showToast(event.data.message || "NyxID 授权已更新。");
-    await refreshRuntimeData();
-  }
+  if (!card) return;
+  card.status = "configuring";
+  card.statusMessage = "在 NyxID 中配置 service 后，返回这里刷新状态。";
+  renderServiceAuthorizationCard(card);
 }
 
 async function refreshAuthSession({ includeServices = false } = {}) {
@@ -547,6 +534,7 @@ async function loadServices() {
     return;
   }
   dom.serviceList.replaceChildren(el("div", "service-access-empty", "正在读取 NyxID services…"));
+  dom.composerServiceList.replaceChildren(el("div", "service-access-empty", "正在读取 NyxID services…"));
   try {
     const response = await fetch("/api/auth/services", { cache: "no-store" });
     if (!response.ok) throw await responseError(response);
@@ -555,29 +543,16 @@ async function loadServices() {
   } catch (error) {
     state.services = [];
     dom.serviceList.replaceChildren(el("div", "service-access-empty service-access-error", error.message));
+    dom.composerServiceList.replaceChildren(
+      el("div", "service-access-empty service-access-error", error.message),
+    );
+    dom.servicesCount.textContent = "0";
+    dom.serviceCount.textContent = "0 / 0";
+    dom.composerServiceCount.textContent = "0 / 0 可用";
     return;
   }
   renderServiceList();
-  maybeAuthorizeMissingCoreServices();
-}
-
-function maybeAuthorizeMissingCoreServices() {
-  const missing = state.services.filter((service) =>
-    service.core && !service.authorized && service.active && service.available);
-  if (!missing.length) {
-    removeSessionStorage(CORE_AUTHORIZATION_ATTEMPT_KEY);
-    return;
-  }
-  const attempt = JSON.stringify({
-    subject: state.auth.user?.id || "",
-    resources: missing.map((service) => service.resourceUri).sort(),
-  });
-  if (readSessionStorage(CORE_AUTHORIZATION_ATTEMPT_KEY) === attempt) return;
-
-  writeSessionStorage(CORE_AUTHORIZATION_ATTEMPT_KEY, attempt);
-  const query = new URLSearchParams();
-  missing.forEach((service) => query.append("serviceId", service.id));
-  beginOAuth(`/api/auth/authorize?${query.toString()}`);
+  refreshAuthorizationCards();
 }
 
 function renderAuthUi() {
@@ -585,8 +560,9 @@ function renderAuthUi() {
   const user = state.auth.user || {};
   dom.accountName.textContent = authenticated ? user.name || "NyxID user" : "尚未登录";
   dom.accountEmail.textContent = authenticated
-    ? user.email || "已通过 NyxID 授权"
-    : "连接 NyxID 后管理 service 授权";
+    ? user.email || "已连接 NyxID 站点会话"
+    : "登录 NyxID 后使用已配置的 services";
+  dom.serviceAccessDescription.textContent = "来自当前 NyxID 账户的可用 services";
   dom.accountAvatar.replaceChildren(authenticated
     ? el("span", "account-initial", (user.name || user.email || "N").slice(0, 1).toUpperCase())
     : iconNode("user-round"));
@@ -597,19 +573,21 @@ function renderAuthUi() {
   dom.emptyTitle.textContent = authenticated ? "NyxID Assistant" : "连接你的 NyxID 账户";
   dom.emptyDescription.textContent = authenticated
     ? "今天要在 NyxID 上做什么？"
-    : "授权 Aevatar 使用你明确选择的 NyxID services";
+    : "使用 NyxID 站点登录态连接 Assistant";
   dom.promptInput.disabled = !authenticated;
   dom.attachButton.disabled = !authenticated;
+  dom.composerServicesButton.disabled = !authenticated;
   dom.sendButton.disabled = !authenticated;
   dom.newChatButton.disabled = !authenticated;
   dom.promptInput.placeholder = authenticated
     ? "告诉 Assistant 你要完成的操作"
     : "请先使用 NyxID 登录";
   if (!authenticated) {
+    closeComposerServices();
     setConnectionStatus("idle", "登录 NyxID");
     setRouteState(dom.routeUpstreamState, "waiting");
     setRouteState(dom.routeOrnnState, "waiting");
-    dom.composerStatus.textContent = "登录后，Aevatar 仅能使用你授权的 services";
+    dom.composerStatus.textContent = "登录后使用当前账户已配置的 services";
     state.conversations = [];
     state.historyError = null;
     state.historyLoading = false;
@@ -624,6 +602,7 @@ function renderServiceList() {
   const authorizedCount = services.filter((service) => service.authorized).length;
   dom.servicesCount.textContent = String(authorizedCount);
   dom.serviceCount.textContent = `${authorizedCount} / ${services.length}`;
+  renderComposerServiceList();
   if (!state.auth.authenticated) {
     dom.serviceList.replaceChildren(el("div", "service-access-empty", "登录后显示 NyxID services"));
     return;
@@ -634,37 +613,83 @@ function renderServiceList() {
   }
   dom.serviceList.replaceChildren();
   for (const service of services) {
-    const row = el("div", `service-access-row${service.authorized ? " authorized" : ""}`);
-    const icon = el("span", "service-access-icon");
-    icon.append(iconNode(service.authorized ? "shield-check" : "lock-keyhole"));
-    const copy = el("div", "service-access-copy");
-    copy.append(
-      el("strong", "", service.label),
-      el("small", "", service.core
-        ? "Chat runtime · required"
-        : `${service.slug}${service.sourceName ? ` · ${service.sourceName}` : ""}`),
-    );
-    const status = el(
-      "span",
-      `service-access-status ${service.authorized ? "granted" : ""}`,
-      service.authorized ? "已授权" : "未授权",
-    );
-    row.append(icon, copy, status);
-    if (!service.authorized && service.active && service.available) {
-      const authorize = el("button", "service-authorize-button", "授权");
-      authorize.type = "button";
-      authorize.addEventListener("click", () => {
-        beginOAuth(`/api/auth/authorize?serviceId=${encodeURIComponent(service.id)}`);
-      });
-      row.append(authorize);
-    }
-    dom.serviceList.append(row);
+    dom.serviceList.append(createServiceAccessRow(service));
   }
   refreshIcons(dom.serviceList);
 }
 
+function createServiceAccessRow(service, { compact = false } = {}) {
+  const row = el(
+    "div",
+    `service-access-row${service.authorized ? " authorized" : ""}${compact ? " compact" : ""}`,
+  );
+  const icon = el("span", "service-access-icon");
+  icon.append(iconNode(service.authorized ? "shield-check" : "lock-keyhole"));
+  const copy = el("div", "service-access-copy");
+  copy.append(
+    el("strong", "", service.label),
+    el("small", "", service.core
+      ? "Chat runtime · required"
+      : `${service.slug}${service.sourceName ? ` · ${service.sourceName}` : ""}`),
+  );
+  const available = service.active && service.available;
+  const status = el(
+    "span",
+    `service-access-status ${service.authorized ? "granted" : ""}`,
+    service.authorized ? "可用" : "需配置",
+  );
+  row.append(icon, copy, status);
+  if (!service.authorized) {
+    const authorize = el("button", "service-authorize-button", "配置");
+    authorize.type = "button";
+    authorize.disabled = !available && service.source === "org";
+    authorize.addEventListener("click", () => openServiceManagement());
+    row.append(authorize);
+  }
+  return row;
+}
+
+function renderComposerServiceList() {
+  const services = state.services;
+  const authorizedCount = services.filter((service) => service.authorized).length;
+  dom.composerServiceCount.textContent = `${authorizedCount} / ${services.length} 可用`;
+  dom.composerServiceList.replaceChildren();
+  if (!state.auth.authenticated) {
+    dom.composerServiceList.append(el("div", "service-access-empty", "登录后显示 NyxID services"));
+    return;
+  }
+  if (!services.length) {
+    dom.composerServiceList.append(el("div", "service-access-empty", "没有可用的 NyxID service"));
+    return;
+  }
+  services.forEach((service) => dom.composerServiceList.append(
+    createServiceAccessRow(service, { compact: true }),
+  ));
+  refreshIcons(dom.composerServiceList);
+}
+
+function toggleComposerServices() {
+  if (!state.auth.authenticated) {
+    beginLogin();
+    return;
+  }
+  const opening = dom.composerServicePanel.classList.contains("hidden");
+  dom.composerServicePanel.classList.toggle("hidden", !opening);
+  dom.composerServicesButton.setAttribute("aria-expanded", String(opening));
+  if (opening) {
+    renderComposerServiceList();
+    refreshIcons(dom.composerServicePanel);
+  }
+}
+
+function closeComposerServices() {
+  dom.composerServicePanel.classList.add("hidden");
+  dom.composerServicesButton.setAttribute("aria-expanded", "false");
+}
+
 async function logout() {
   abortAllRuns();
+  closeComposerServices();
   dom.logoutButton.disabled = true;
   try {
     await fetch("/api/auth/logout", { method: "POST", headers: demoHeaders() });
@@ -674,7 +699,6 @@ async function logout() {
     state.services = [];
     state.config.scopeId = "";
     state.health = null;
-    removeSessionStorage(CORE_AUTHORIZATION_ATTEMPT_KEY);
     closeSettings();
     newChat({ refreshHistory: false });
     for (const entry of Array.from(state.conversationStates.values())) {
@@ -695,6 +719,7 @@ function autoResizeComposer() {
 }
 
 function openSettings() {
+  closeComposerServices();
   applyConfigToForm(state.config);
   updateSettingsVisibility();
   if (!dom.settingsDialog.open) dom.settingsDialog.showModal();
@@ -718,7 +743,7 @@ function readSettingsForm() {
   return {
     ...state.config,
     surface,
-    transport: "nyxid-oauth",
+    transport: "nyxid-session",
     workflow: dom.workflowInput.value,
   };
 }
@@ -753,7 +778,7 @@ async function refreshRuntimeData() {
 
 function updateConfigUi() {
   const surface = surfaceLabels[state.config.surface];
-  const transport = transportLabels[state.config.transport];
+  const transport = transportLabels[state.config.transport] || state.config.transport;
   dom.sidebarSurface.textContent = surface;
   dom.sidebarTransport.textContent = transport;
   dom.routeTransportValue.textContent = transport;
@@ -768,19 +793,19 @@ function updateConfigUi() {
   dom.stopButton.setAttribute("aria-label", "停止接收");
   dom.stopButton.title = "停止接收（不会撤销已提交的生产操作）";
   dom.composerStatus.textContent = state.auth.authenticated
-    ? "生产环境 · 仅可使用已授权 services，高风险操作需要确认"
-    : "登录后，Aevatar 仅能使用你授权的 services";
+    ? "生产环境 · 使用当前账户的 services，高风险操作需要确认"
+    : "登录后使用当前账户已配置的 services";
   renderHistoryList();
 }
 
 function shortTransport() {
-  return state.config.transport === "nyxid-oauth" ? "NyxID OAuth" : state.config.transport;
+  return state.config.transport === "nyxid-session" ? "NyxID session" : state.config.transport;
 }
 
 async function checkConnection(config, inDialog) {
   if (!state.auth.authenticated) {
     if (!inDialog) setConnectionStatus("idle", "登录 NyxID");
-    if (inDialog) setDialogConnection("idle", "尚未连接", "登录后通过 NyxID OAuth 调用 Aevatar");
+    if (inDialog) setDialogConnection("idle", "尚未连接", "登录后通过 NyxID 站点会话调用 Aevatar");
     return;
   }
   if (!inDialog) {
@@ -1170,9 +1195,9 @@ function formatHistoryTime(value) {
     : { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
-async function sendPrompt(overridePrompt) {
+async function sendPrompt(overridePrompt, options = {}) {
   if (!state.auth.authenticated) {
-    beginOAuth("/api/auth/login");
+    beginLogin();
     return;
   }
   if (state.activeController) {
@@ -1180,7 +1205,9 @@ async function sendPrompt(overridePrompt) {
     return;
   }
   const prompt = String(overridePrompt ?? dom.promptInput.value).trim();
-  if (!prompt && !state.attachment) return;
+  const hasOverrideAttachment = Object.prototype.hasOwnProperty.call(options, "attachment");
+  const attachment = hasOverrideAttachment ? options.attachment : state.attachment;
+  if (!prompt && !attachment) return;
 
   const conversation = state.activeConversation;
   state.run = createRunState();
@@ -1188,6 +1215,7 @@ async function sendPrompt(overridePrompt) {
   state.run.surface = state.config.surface;
   state.run.config = configPayload(state.config);
   state.run.startedAt = Date.now();
+  state.run.request = { prompt, attachment };
   const controller = new AbortController();
   const run = state.run;
   const runSurface = state.config.surface;
@@ -1198,13 +1226,14 @@ async function sendPrompt(overridePrompt) {
   conversation.controller = controller;
   conversation.controllers.add(controller);
   dom.emptyState.classList.add("hidden");
-  const attachment = state.attachment;
   addUserMessage(prompt, attachment);
   if (!state.actorId) setConversationTitle(prompt || attachment?.name || "附件会话");
-  dom.promptInput.value = "";
-  conversation.draft = "";
-  autoResizeComposer();
-  clearAttachment();
+  if (!options.preserveComposer) {
+    dom.promptInput.value = "";
+    conversation.draft = "";
+    autoResizeComposer();
+    if (!hasOverrideAttachment) clearAttachment();
+  }
   setRunningUi(true);
   setRunStatus("running", "Running");
   setRouteState(dom.routeUpstreamState, "streaming", "active");
@@ -1241,7 +1270,14 @@ async function sendPrompt(overridePrompt) {
       addInfo("SSE 已关闭，但没有收到明确的终止事件。");
     });
   } catch (error) {
-    const authExpired = error.code === "AUTH_REQUIRED" || error.code === "OAUTH_TOKEN_EXCHANGE_FAILED";
+    const authExpired = error.code === "AUTH_REQUIRED";
+    const authorizationFailure = findServiceAuthorizationFailure({
+      code: error.code,
+      message: error.message,
+      serviceId: error.serviceId,
+      serviceSlug: error.serviceSlug,
+      resource: error.resource,
+    });
     withConversationState(conversation, () => {
       if (error.name === "AbortError") {
         state.run.status = "stopped";
@@ -1259,8 +1295,16 @@ async function sendPrompt(overridePrompt) {
       finalizeRunningExecution("error", "Run failed");
       setRunStatus("error", "Error");
       dom.sidebarSessionMeta.textContent = "Failed";
-      if (error.status === 403 || error.code === "SERVICE_NOT_AUTHORIZED") {
-        addServiceAuthorizationPrompt(error.message || "此操作需要新的 service 权限。");
+      if (authorizationFailure) {
+        addServiceAuthorizationPrompt(
+          authorizationFailure.message || error.message || "此操作需要一个尚未配置的 service。",
+          {
+            serviceId: error.serviceId,
+            serviceSlug: error.serviceSlug || authorizationFailure.serviceSlug,
+            resource: error.resource,
+            retry: run.request,
+          },
+        );
       } else if (!authExpired) {
         addError(error.message || "请求失败");
       }
@@ -1268,7 +1312,10 @@ async function sendPrompt(overridePrompt) {
     if (authExpired) {
       await refreshAuthSession();
       withConversationState(conversation, () => {
-        addServiceAuthorizationPrompt("NyxID 登录已失效，请重新授权。", { login: true });
+        addServiceAuthorizationPrompt("NyxID 登录已失效，请重新登录。", {
+          login: true,
+          retry: run.request,
+        });
       });
     }
   } finally {
@@ -1295,7 +1342,9 @@ async function responseError(response) {
     const error = new Error(payload.message || payload.detail || payload.error || `HTTP ${response.status}`);
     error.code = payload.code || "";
     error.status = response.status;
+    error.serviceId = payload.serviceId || payload.service_id || "";
     error.serviceSlug = payload.serviceSlug || payload.service_slug || "";
+    error.resource = payload.resource || payload.resourceUri || payload.resource_uri || "";
     return error;
   } catch {
     const error = new Error(`HTTP ${response.status}`);
@@ -1376,8 +1425,13 @@ function handleFrame(raw) {
         item.id === event.serviceId || item.slug === event.serviceSlug ||
         item.resourceUri === event.resource);
       addServiceAuthorizationPrompt(
-        event.message || `授权 ${event.serviceLabel || event.serviceSlug || "此 service"} 后重试该请求。`,
-        { serviceId: service?.id || event.serviceId || "" },
+        event.message || `连接 ${event.serviceLabel || event.serviceSlug || "此 service"} 后重试该请求。`,
+        {
+          serviceId: service?.id || event.serviceId || "",
+          serviceSlug: service?.slug || event.serviceSlug || "",
+          resource: service?.resourceUri || event.resource || event.resourceUri || "",
+          retry: state.run.request,
+        },
       );
       break;
     }
@@ -1620,7 +1674,12 @@ function finishTool(event) {
   if (authorizationFailure && !state.run.authorizationPrompted) {
     state.run.authorizationPrompted = true;
     const service = state.services.find((item) => item.slug === authorizationFailure.serviceSlug);
-    addServiceAuthorizationPrompt(authorizationFailure.message, { serviceId: service?.id || "" });
+    addServiceAuthorizationPrompt(authorizationFailure.message, {
+      serviceId: service?.id || "",
+      serviceSlug: service?.slug || authorizationFailure.serviceSlug,
+      resource: service?.resourceUri || "",
+      retry: state.run.request,
+    });
   }
   resolved.duration.textContent = formatDuration(resolved.completedAt - resolved.startedAt);
   finishStep(resolved.name, "tool", resolved.status, resolved.id);
@@ -1636,6 +1695,8 @@ function findServiceAuthorizationFailure(value) {
   const matched = [
     "authorization_required",
     "service_not_authorized",
+    "service_access_required",
+    "service authorization required",
     "not authorized for this service",
     "not authorized for service",
     "does not have access to this service",
@@ -1645,12 +1706,16 @@ function findServiceAuthorizationFailure(value) {
     "invalid_target",
   ].some((marker) => text.includes(marker));
   if (!matched) return null;
-  const slug = text.match(/(?:service|slug)[\s"':=]+([a-z0-9][a-z0-9-]{1,80})/)?.[1] || "";
+  const explicitSlug = value && typeof value === "object"
+    ? value.serviceSlug || value.service_slug || ""
+    : "";
+  const slug = String(explicitSlug).trim().toLowerCase() ||
+    text.match(/(?:service|slug)[\s"':=]+([a-z0-9][a-z0-9-]{1,80})/)?.[1] || "";
   return {
     serviceSlug: slug,
     message: slug
-      ? `Aevatar 需要 ${slug} 的权限。授权后请重试这条消息。`
-      : "Aevatar 需要新的 NyxID service 权限。授权后请重试这条消息。",
+      ? `Aevatar 需要可用的 ${slug} 连接。配置后请重试这条消息。`
+      : "Aevatar 需要一个尚未配置的 NyxID service。配置后请重试这条消息。",
   };
 }
 
@@ -1942,25 +2007,181 @@ function addInfo(message) {
   scrollThread();
 }
 
-function addServiceAuthorizationPrompt(message, { login = false, serviceId = "" } = {}) {
-  const callout = el("div", "authorization-callout");
-  const copy = el("div", "authorization-callout-copy");
-  copy.append(
-    el("strong", "", login ? "需要 NyxID 登录" : "需要新的 Service 权限"),
-    el("span", "", String(message).slice(0, 600)),
-  );
-  const action = el("button", "service-authorize-button", login ? "登录" : "查看 Services");
-  action.type = "button";
-  action.prepend(iconNode(login ? "log-in" : "shield-plus"));
-  action.addEventListener("click", () => {
-    if (login) beginOAuth("/api/auth/login");
-    else if (serviceId) beginOAuth(`/api/auth/authorize?serviceId=${encodeURIComponent(serviceId)}`);
-    else openSettings();
-  });
-  callout.append(iconNode("key-round"), copy, action);
-  ensureAssistantBody().append(callout);
-  refreshIcons(callout);
+function findNyxidService({ serviceId = "", serviceSlug = "", resource = "" } = {}) {
+  const normalizedSlug = String(serviceSlug).trim().toLowerCase();
+  return state.services.find((service) =>
+    (serviceId && service.id === serviceId) ||
+    (normalizedSlug && String(service.slug).toLowerCase() === normalizedSlug) ||
+    (resource && service.resourceUri === resource)) || null;
+}
+
+function refreshAuthorizationCards() {
+  for (const conversation of state.conversationStates.values()) {
+    for (const card of conversation.run.authorizationCards) {
+      if (card.status === "retried") continue;
+      if (card.login) {
+        if (!state.auth.authenticated) continue;
+      } else {
+        const service = findNyxidService(card);
+        if (!service?.authorized) continue;
+        card.serviceId = service.id;
+        card.serviceSlug = service.slug;
+        card.resource = service.resourceUri;
+      }
+      card.status = "granted";
+      card.statusMessage = card.login
+        ? "NyxID 登录已恢复，可以重试原请求。"
+        : "Service 已连接，可以重试原请求。";
+      renderServiceAuthorizationCard(card);
+    }
+  }
+}
+
+function addServiceAuthorizationPrompt(message, {
+  login = false,
+  serviceId = "",
+  serviceSlug = "",
+  resource = "",
+  retry = null,
+} = {}) {
+  const service = findNyxidService({ serviceId, serviceSlug, resource });
+  const card = {
+    root: el("div", "authorization-callout"),
+    login,
+    message: String(message).slice(0, 600),
+    retry,
+    serviceId: service?.id || serviceId,
+    serviceSlug: service?.slug || serviceSlug,
+    resource: service?.resourceUri || resource,
+    status: service?.authorized ? "granted" : "idle",
+    statusMessage: service?.authorized
+      ? "Service 已连接，可以重试原请求。"
+      : "",
+  };
+  state.run.authorizationCards.push(card);
+  ensureAssistantBody().append(card.root);
+  renderServiceAuthorizationCard(card);
   scrollThread();
+}
+
+function renderServiceAuthorizationCard(card) {
+  if (!card.root?.isConnected && !card.root?.parentNode) return;
+  const service = card.login ? null : findNyxidService(card);
+  if (service) {
+    card.serviceId = service.id;
+    card.serviceSlug = service.slug;
+    card.resource = service.resourceUri;
+  }
+  const granted = card.status === "granted" || card.status === "retried";
+  card.root.className = `authorization-callout ${card.status}`;
+  card.root.replaceChildren();
+  card.root.append(iconNode(granted ? "shield-check" : card.login ? "log-in" : "key-round"));
+
+  const content = el("div", "authorization-callout-content");
+  const copy = el("div", "authorization-callout-copy");
+  const titles = {
+    configuring: "正在配置 Service",
+    checking: "正在刷新 Service 状态",
+    error: "连接未完成",
+    granted: card.login ? "NyxID 已连接" : "Service 可用",
+    retried: "请求已重新提交",
+  };
+  copy.append(
+    el("strong", "", titles[card.status] || (card.login ? "需要 NyxID 登录" : "需要 Service 连接")),
+    el("span", "", card.statusMessage || card.message),
+  );
+  content.append(copy);
+
+  if (!card.login) {
+    if (service || card.serviceSlug) {
+      const summary = el("div", "authorization-service-summary");
+      const serviceIcon = el("span", "authorization-service-icon");
+      serviceIcon.append(iconNode(service?.authorized ? "shield-check" : "box"));
+      const serviceCopy = el("span", "authorization-service-copy");
+      serviceCopy.append(
+        el("strong", "", service?.label || card.serviceSlug || "NyxID Service"),
+        el("small", "", service?.slug || card.serviceSlug || "service"),
+      );
+      const serviceState = el(
+        "em",
+        service?.authorized ? "granted" : "",
+        service?.authorized ? "可用" : service ? "需配置" : "未找到",
+      );
+      summary.append(serviceIcon, serviceCopy, serviceState);
+      content.append(summary);
+    }
+  }
+
+  const actions = el("div", "authorization-callout-actions");
+  if (granted && card.retry && (card.retry.prompt || card.retry.attachment)) {
+    if (card.status === "granted") {
+      const retry = el("button", "service-authorize-button", "重试请求");
+      retry.type = "button";
+      retry.prepend(iconNode("refresh-cw"));
+      retry.addEventListener("click", () => {
+        if (state.activeController) {
+          showToast("当前运行尚未结束。");
+          return;
+        }
+        card.status = "retried";
+        card.statusMessage = "原请求已重新提交。";
+        renderServiceAuthorizationCard(card);
+        void sendPrompt(card.retry.prompt, {
+          attachment: card.retry.attachment,
+          preserveComposer: true,
+        });
+      });
+      actions.append(retry);
+    }
+  } else if (!granted) {
+    const refreshing = card.status === "configuring";
+    const checking = card.status === "checking";
+    const action = el(
+      "button",
+      "service-authorize-button",
+      card.login ? "登录" : checking ? "正在刷新" : refreshing ? "刷新状态" : "管理 Services",
+    );
+    action.type = "button";
+    action.disabled = checking;
+    action.prepend(iconNode(card.login ? "log-in" : checking ? "loader-circle" :
+      refreshing ? "refresh-cw" : "settings"));
+    action.addEventListener("click", () => {
+      if (card.login) {
+        beginLogin();
+        return;
+      }
+      if (refreshing) {
+        void refreshServiceAuthorizationCard(card);
+        return;
+      }
+      openServiceManagement(card);
+    });
+    actions.append(action);
+  }
+  const manage = el("button", "icon-button authorization-manage-button");
+  manage.type = "button";
+  manage.setAttribute("aria-label", "管理全部 NyxID services");
+  manage.title = "管理全部 Services";
+  manage.append(iconNode("boxes"));
+  manage.addEventListener("click", () => openServiceManagement());
+  actions.append(manage);
+
+  card.root.append(content, actions);
+  refreshIcons(card.root);
+}
+
+async function refreshServiceAuthorizationCard(card) {
+  card.status = "checking";
+  card.statusMessage = "正在从 NyxID 读取最新 service 状态。";
+  renderServiceAuthorizationCard(card);
+  await loadServices();
+  const service = findNyxidService(card);
+  if (service?.authorized) return;
+  card.status = "error";
+  card.statusMessage = service
+    ? "尚未检测到可用的 service 凭据，可以重新打开 NyxID 配置。"
+    : "当前 NyxID 账户中没有找到该 service。";
+  renderServiceAuthorizationCard(card);
 }
 
 function completeRun() {
@@ -2082,6 +2303,7 @@ function setRunningUi(running) {
   dom.stopButton.classList.toggle("hidden", !running);
   dom.promptInput.disabled = !canCompose;
   dom.attachButton.disabled = !canCompose;
+  dom.composerServicesButton.disabled = !state.auth.authenticated;
   dom.sendButton.disabled = !canCompose;
   dom.newChatButton.disabled = !state.auth.authenticated;
   dom.settingsButton.disabled = false;
@@ -2092,8 +2314,8 @@ function setRunningUi(running) {
   dom.composerStatus.textContent = running
     ? "正在接收生产 Agent 输出 · 停止接收不会撤销已提交操作"
     : state.auth.authenticated
-      ? "生产环境 · 仅可使用已授权 services，高风险操作需要确认"
-      : "登录后，Aevatar 仅能使用你授权的 services";
+      ? "生产环境 · 使用当前账户的 services，高风险操作需要确认"
+      : "登录后使用当前账户已配置的 services";
 }
 
 function cancelRun() {

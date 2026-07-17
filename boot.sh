@@ -3,6 +3,15 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${NYXID_CHAT_ENV_FILE:-${ROOT_DIR}/.env}"
+
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+  set +a
+fi
+
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-4310}"
 PID_FILE="${NYXID_CHAT_PID_FILE:-${ROOT_DIR}/.nyxid-chat.pid}"
@@ -83,16 +92,34 @@ done
 cd "${ROOT_DIR}"
 printf '\n[%s] Starting NyxID Chat on %s:%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${HOST}" "${PORT}" >>"${LOG_FILE}"
 server_pid=""
+launch_environment=("HOST=${HOST}" "PORT=${PORT}")
+for env_name in \
+  AEVATAR_BASE_URL \
+  DEMO_DEFAULT_SURFACE \
+  DEMO_STREAM_PROGRESS_TIMEOUT_MS \
+  NYXID_AEVATAR_PROXY_URL \
+  NYXID_BASE_URL \
+  NYXID_LLM_SERVICE_SLUG \
+  NYXID_ORNN_SERVICE_SLUG \
+  NYXID_SESSION_COOKIE_NAME \
+  NYXID_WEB_URL \
+  ORNN_WEB_URL; do
+  env_value="${!env_name-}"
+  if [[ -n "${env_value}" ]]; then
+    launch_environment+=("${env_name}=${env_value}")
+  fi
+done
+
 if [[ "${USE_LAUNCHD}" == true ]]; then
   node_path="$(command -v node)"
   /bin/launchctl submit \
     -l "${LAUNCH_LABEL}" \
     -o "${LOG_FILE}" \
     -e "${LOG_FILE}" \
-    -- /usr/bin/env HOST="${HOST}" PORT="${PORT}" "${node_path}" "${ROOT_DIR}/server.mjs" \
+    -- /usr/bin/env "${launch_environment[@]}" "${node_path}" "${ROOT_DIR}/server.mjs" \
     || fail "launchd could not start NyxID Chat"
 else
-  nohup env HOST="${HOST}" PORT="${PORT}" node "${ROOT_DIR}/server.mjs" >>"${LOG_FILE}" 2>&1 </dev/null &
+  nohup env "${launch_environment[@]}" node "${ROOT_DIR}/server.mjs" >>"${LOG_FILE}" 2>&1 </dev/null &
   server_pid=$!
   disown "${server_pid}" 2>/dev/null || true
 fi

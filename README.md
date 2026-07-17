@@ -1,114 +1,119 @@
-# NyxID x Aevatar Chat
+# NyxID Assistant Chat
 
-这是 NyxID Assistant 的生产联调页面。浏览器通过 NyxID OIDC 授权 `aevatar`
-developer app，并默认请求 Aevatar、Chrono LLM 和 Ornn 三个核心 service。用户确认后，
-本地 BFF 保存 HttpOnly session 和服务器侧 broker `binding_id`，再用短期 access token
-经 NyxID proxy 调用生产 Aevatar。
+这是准备直接集成到 NyxID website 的 Assistant 页面。它复用用户已经建立的 NyxID
+站点登录态，不再注册或授权 `aevatar` developer app，也不再创建 developer-app OAuth
+session、broker `binding_id` 或执行 token exchange。
 
-浏览器不接触 NyxID access token、refresh token、broker binding 或 service credential。
+NyxID 当前网页端并不会把 access token 暴露给 JavaScript。浏览器使用的是 HttpOnly
+`nyx_session` cookie；同源部署时浏览器会自动把它带给 Chat BFF。BFF 调用
+`/api/v1/users/me` 校验用户，再把同一登录凭据转发给 NyxID proxy。宿主若使用 token-based
+认证，也可以显式传入 `Authorization: Bearer ...`，但标准 website 集成不需要读取或存储
+access token。
 
-## 生产端点
+localhost 联调是一个受限的例外：由于线上 HttpOnly cookie 不可能发送给 localhost，登录入口
+会使用 NyxID 已有的 `/cli-auth` first-party handoff。它基于用户现有站点 session 签发普通用户
+token，回送到本机 `/callback`；BFF 把 access/refresh token 保存在内存中，浏览器只得到一枚
+本机 HttpOnly session cookie。该流程同样不需要 developer app。
 
-| 系统 | 端点 | 用途 |
-|---|---|---|
-| NyxID | `https://nyx-api.chrono-ai.fun` | OIDC、service consent、broker 和 proxy |
-| Aevatar via NyxID | `https://nyx-api.chrono-ai.fun/api/v1/proxy/s/aevatar` | Chat 的固定入口 |
-| Chrono LLM | NyxID service slug `chrono-llm-public` | Chat 的默认 LLM |
-| Aevatar | `https://aevatar-console-backend-api.aevatar.ai` | `NyxIdChatGAgent` |
-| Ornn | NyxID service slug `ornn-api` | 默认 skill search / execution |
+## 请求链路
 
-## OAuth 配置
+```text
+NyxID website (already signed in)
+  -> Chat BFF + nyx_session
+     -> NyxID /api/v1/users/me
+     -> NyxID proxy /aevatar + the same site session
+        -> NyxIdChatGAgent
+           -> the user's configured NyxID services
+```
 
-联调前需要创建或选择一个启用了 broker capability 的 NyxID public developer app：
+```text
+localhost development
+  -> NyxID /cli-auth + existing nyx_session
+     -> localhost /callback + user tokens
+        -> local HttpOnly BFF session
+           -> NyxID proxy
+```
 
-- Client ID：通过 `NYXID_OAUTH_CLIENT_ID` 环境变量提供，不提交到仓库
-- 本地 callback：`http://127.0.0.1:4310/auth/callback`
-- 备用开发 callback：`http://127.0.0.1:4311/auth/callback`
-- 请求 scopes：`openid profile email proxy`
-- 不请求 `offline_access`；持续访问使用 opaque broker binding
-- 初次授权请求 `aevatar`、`chrono-llm-public` 和 `ornn-api` resources
+这里仍有三个独立的安全边界：
 
-生产部署应改为正式 Chat client，并使用 confidential client 或 DPoP/mTLS sender
-constraint。
+- NyxID 站点 session 证明当前用户身份。
+- `/api/v1/user-services` 和 NyxID proxy policy 决定该用户可以使用哪些 service。
+- 写入或不可逆操作仍必须由 NyxID/Aevatar 服务端 policy 强制批准。
+
+不存在 developer-app consent 或 RFC 8707 resource allowlist。Services 面板展示的是当前
+账户的连接可用性；缺少连接时打开 NyxID 的 `/keys` 页面进行配置。Agent 返回
+`AUTHORIZATION_REQUIRED` 时，Chat 仍会保留原请求并显示配置卡，但只有用户明确点击
+“重试请求”才会再次提交，避免重复已经部分执行的生产操作。
+
+## 部署要求
+
+生产环境必须把页面和 BFF 放在 NyxID website 的同一站点下，或由同一入口反向代理，确保：
+
+- 浏览器请求 Chat API 时会自动携带 `nyx_session`。
+- session cookie 的 `Path` 覆盖 Chat API；默认 cookie 名是 `nyx_session`。
+- 反向代理保留原始 `Host`，或设置可信的 `X-Forwarded-Host` / `X-Forwarded-Proto`。
+- NyxID API 仍由 `NYXID_BASE_URL` 指向；BFF 不直接读取 NyxID 数据库。
+
+不要为了跨域 standalone 页面把 HttpOnly session token 写入 localStorage。生产页面若运行在
+另一个 site，仍无法安全复用 NyxID 的站点 cookie；内置 token handoff 只接受
+`localhost`、`127.0.0.1` 和 loopback IPv6。
+
+## 配置
+
+```dotenv
+HOST=127.0.0.1
+PORT=4310
+NYXID_BASE_URL=https://nyx-api.chrono-ai.fun
+NYXID_WEB_URL=https://nyx.chrono-ai.fun
+NYXID_SESSION_COOKIE_NAME=nyx_session
+NYXID_AEVATAR_PROXY_URL=https://nyx-api.chrono-ai.fun/api/v1/proxy/s/aevatar
+NYXID_LLM_SERVICE_SLUG=chrono-llm-public
+NYXID_ORNN_SERVICE_SLUG=ornn-api
+DEMO_STREAM_PROGRESS_TIMEOUT_MS=120000
+```
+
+不再需要以下变量：
+
+```text
+NYXID_OAUTH_CLIENT_ID
+NYXID_OAUTH_REDIRECT_URI
+NYXID_OAUTH_SCOPES
+```
+
+完整配置见 `.env.example`。`server.mjs` 不自行加载 `.env`；`boot.sh` 会加载它并传给后台
+进程，其他启动方式需由 shell、容器或进程管理器注入。
 
 ## 运行
 
-要求 Node.js 20+，不要求 NyxID CLI 登录态。
+要求 Node.js 20+：
 
 ```bash
-NYXID_OAUTH_CLIENT_ID=your-public-client-id npm start
-```
-
-打开 <http://127.0.0.1:4310>，点击“使用 NyxID 登录”。
-
-如端口或域名不同，callback 必须精确注册，并通过环境变量覆盖：
-
-```bash
-PORT=4311 \
-NYXID_OAUTH_REDIRECT_URI=http://127.0.0.1:4311/auth/callback \
+npm install
 npm start
 ```
 
-完整配置见 `.env.example`。服务不会自动加载 `.env`，需由 shell、容器或进程管理器注入。
+也可以使用根目录脚本；它会加载 `.env`、停止本 repo 的旧进程，并在 macOS 上交给
+`launchd` 托管：
 
-## 授权模型
-
-```text
-Browser
-  -> local BFF HttpOnly session
-     -> NyxID Authorization Code + PKCE
-        -> consent: aevatar + chrono-llm-public + ornn-api + selected resources
-           -> opaque broker binding (server-side only)
-              -> 5-minute access token
-                 -> NyxID proxy / aevatar
-                    -> NyxIdChatGAgent
-                       -> authorized NyxID services only
+```bash
+./boot.sh
 ```
 
-登录、service consent 和单次高风险操作批准是三个不同边界：
+直接打开 `http://127.0.0.1:4310` 后点击登录，会先进入 NyxID `/cli-auth`；已有登录态时会
+自动回到本机，未登录时则先完成 NyxID 登录再回跳。生产部署仍应使用同源站点 session，
+不会经过该 handoff。
 
-- 登录证明 NyxID 用户身份，并默认请求三个 Chat 核心 services；用户仍需在 NyxID 明确确认。
-- Service access 由 consent 的 RFC 8707 resource allowlist 决定。
-- 写入或不可逆操作仍必须由 NyxID/Aevatar 服务端 policy 强制批准。
-
-## 增量 Service 授权
-
-NyxID 当前支持从 Chat 发起增量授权：
-
-1. BFF 用当前 access token读取 `/api/v1/user-services`。
-2. 用户在 Chat 的 Services 面板点击“授权”。
-3. BFF 读取该 client 当前 consent，并携带原有 resources 与新增 resource 重新 authorize。
-4. NyxID 显示 consent 页面；用户确认后返回新的 authorization code 和 broker binding。
-5. BFF 原子替换 session binding，并撤销旧 binding。
-
-入口是 `GET /api/auth/authorize?serviceId=<USER_SERVICE_ID>`。service ID 会在 BFF 中解析为
-NyxID 返回的 canonical `resource_uri`，浏览器不能自行提交任意上游 URL。由于 NyxID consent
-更新会替换 allowlist，BFF 会显式合并已有 consent，避免复用 `aevatar` client 时误删权限。
-
-对于升级前已经登录、但缺少 Chrono LLM 或 Ornn 权限的 session，页面会检测缺失的核心
-service 并自动发起一次补充 consent。若用户拒绝，本标签页不会循环跳转；用户仍可稍后在
-Services 面板手动再次授权。
-
-当前 NyxID broker binding exchange 只窄化 OAuth scope，不接受单次 exchange 的 resource
-窄化。因此本实现的最小权限边界是“当前 consent/binding 已授权的 services”，不是“单次
-tool call 的一个 service”。后续应让 binding exchange 接受 `resource` 并与 consent 求交集。
-
-## 多会话并行
-
-Chat 前端按 conversation 保存独立的 actor/session、SSE controller、消息视图、审批状态、
-工具步骤、events 和 usage。新建或切换会话不会终止其他会话的流；后台会话继续完整消费
-事件，切回时直接恢复原视图。停止按钮只停止当前会话，退出登录和删除会话才会终止相应
-controller。
+SSE 连续 120 秒只收到 keepalive 而没有工具、文本或运行状态事件时，BFF 会返回
+`UPSTREAM_PROGRESS_TIMEOUT` 并取消上游流。可通过 `DEMO_STREAM_PROGRESS_TIMEOUT_MS` 调整。
 
 ## 本地 API
 
 ```text
-GET    /api/auth/login
-GET    /auth/callback
-GET    /api/auth/session
-GET    /api/auth/services
-GET    /api/auth/authorize?serviceId=...
-POST   /api/auth/logout
+GET    /api/auth/login          # 同源跳登录页；localhost 跳 first-party token handoff
+GET    /callback                # localhost token handoff callback
+GET    /api/auth/session        # 校验并返回当前站点用户，不返回凭据
+GET    /api/auth/services       # 当前用户的 service 可用性
+POST   /api/auth/logout         # 退出整个 NyxID 站点 session
 
 GET    /api/demo/config
 POST   /api/demo/health
@@ -119,35 +124,22 @@ GET    /api/demo/conversations/{actorId}
 DELETE /api/demo/conversations/{actorId}
 ```
 
-所有 `/api/demo/*` 运行和历史接口都从 HttpOnly session 解析用户 `sub` 作为 Aevatar
-scope，忽略浏览器提交的 scope 或 bearer。
+旧的 `GET /api/auth/authorize` 会返回 `410 DEVELOPER_APP_AUTH_REMOVED`，用于尽早发现仍在调用
+developer-app consent 的旧前端；OAuth callback 已删除。
 
 ## 安全边界
 
-- OAuth 使用 Authorization Code、PKCE S256、state 和 nonce。
-- ID token 使用 NyxID JWKS 验证 RS256、issuer、audience、expiry 和 nonce。
-- broker binding 和短期 access token 只保存在 BFF 内存。
-- 增量授权只能选择 `/api/v1/user-services` 返回且当前可用的 service。
-- logout 和 binding 替换都会撤销旧 binding。
-- SSE/raw event 仍执行凭据与 reasoning 脱敏。
-- Aevatar approval 卡片不是最终安全边界；proxy policy 必须独立执行。
-
-本地内存 session 适合联调，不适合多实例生产。正式部署需要加密的共享 session store、
-DPoP 或 mTLS、完整的 binding 生命周期清理，以及 revocation webhook。
-
-## Aevatar API surface
-
-```text
-POST   /api/chat
-POST   /api/scopes/{scopeId}/nyxid-chat/conversations
-GET    /api/scopes/{scopeId}/nyxid-chat/conversations
-DELETE /api/scopes/{scopeId}/nyxid-chat/conversations/{actorId}
-POST   /api/scopes/{scopeId}/nyxid-chat/conversations/{actorId}:stream
-POST   /api/scopes/{scopeId}/nyxid-chat/conversations/{actorId}:approve
-GET    /api/scopes/{scopeId}/chat-history
-GET    /api/scopes/{scopeId}/chat-history/conversations/{actorId}
-DELETE /api/scopes/{scopeId}/chat-history/conversations/{actorId}
-```
+- BFF 只从浏览器 cookie 中挑选 `NYXID_SESSION_COOKIE_NAME`，不会把其他站点 cookie 转发给
+  NyxID API 或 Aevatar。
+- localhost handoff 使用一次性随机 state（10 分钟有效）；token 只进入 BFF 内存，refresh
+  token 不写入浏览器 storage。
+- 同源登录由页面显式携带当前站内回跳路径，BFF 只接受 NyxID website 同源目标。
+- 显式 bearer 优先于 ambient cookie，方便由可信宿主注入 token；响应和日志不回显凭据。
+- 所有非安全方法继续执行同源校验，支持反向代理的 `X-Forwarded-Host`。
+- 用户 ID 只取自 `/api/v1/users/me`，忽略浏览器提交的 scope 或 user ID。
+- logout 的 `Set-Cookie` 会从 NyxID API 原样返回浏览器。
+- SSE/raw event 继续执行凭据和 reasoning 脱敏。
+- Aevatar approval 卡片不是最终安全边界，proxy policy 必须独立执行。
 
 ## 验证
 
@@ -158,18 +150,19 @@ node --check public/app.js
 node --check public/protocol.js
 ```
 
-协议测试覆盖 SSE 分块、Aevatar frame normalization、结构化 service authorization request、
-usage 合并、历史 normalization 以及凭据/reasoning 脱敏。
+测试覆盖站点 cookie/bearer 转发、cookie allowlist、同源保护、登录与退出、service 配置后显式
+重试、多会话并行、SSE normalization、usage 合并、历史 normalization 和凭据脱敏。
 
 ## 文件结构
 
 ```text
-server.mjs              # OAuth BFF、broker session、NyxID/Aevatar SSE proxy
-public/index.html       # Chat、账户和 service access UI
-public/styles.css       # 响应式界面
-public/app.js           # OAuth 状态、会话、增量授权、SSE 和审批
-public/protocol.js      # SSE/AGUI/protobuf normalization + redaction
-test/protocol.test.mjs  # 协议测试
-test/server.test.mjs    # OAuth BFF 与增量授权集成测试
-test/app-concurrency.test.mjs # 多会话并行 SSE 与视图隔离测试
+server.mjs                         # first-party session BFF + NyxID/Aevatar SSE proxy
+public/index.html                  # Chat、账户和 service 可用性 UI
+public/styles.css                  # 响应式界面
+public/app.js                      # 站点 session、会话、service 配置、SSE 和审批
+public/protocol.js                 # SSE/AGUI/protobuf normalization + redaction
+test/server.test.mjs               # first-party session BFF 集成测试
+test/app-authorization.test.mjs    # service 配置与显式重试测试
+test/app-concurrency.test.mjs      # 多会话并行 SSE 与视图隔离测试
+test/protocol.test.mjs             # 协议测试
 ```

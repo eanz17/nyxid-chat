@@ -1,9 +1,10 @@
-import { createHash, createPublicKey, randomBytes, randomUUID, verify } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { extractSseEvents, normalizeFrame } from "./public/protocol.js";
 
 const ROOT = fileURLToPath(new URL(".", import.meta.url));
 const PUBLIC_ROOT = resolve(ROOT, "public");
@@ -11,23 +12,18 @@ const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number.parseInt(process.env.PORT || "4310", 10);
 const MAX_REQUEST_BYTES = 10 * 1024 * 1024;
 const ALLOWED_SURFACES = new Set(["workflow", "nyxid-chat"]);
-const SESSION_COOKIE = "nyxid_chat_session";
-const OAUTH_STATE_COOKIE = "nyxid_chat_oauth_state";
-const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
-const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
-const BROKER_SUBJECT_TOKEN_TYPE = "urn:nyxid:params:oauth:token-type:binding-id";
-const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
-const sessions = new Map();
-const oauthStates = new Map();
-let jwksCache = null;
-const OAUTH_CLIENT_ID = String(process.env.NYXID_OAUTH_CLIENT_ID || "").trim();
-
-if (!OAUTH_CLIENT_ID) {
-  throw new Error("NYXID_OAUTH_CLIENT_ID is required.");
-}
+const LOCAL_TOKEN_SESSION_COOKIE = "nyxid_chat_token_session";
+const LOGIN_HANDOFF_TTL_MS = 10 * 60 * 1000;
+const LOCAL_TOKEN_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const loginHandoffs = new Map();
+const localTokenSessions = new Map();
+const STREAM_PROGRESS_TIMEOUT_MS = positiveInteger(
+  process.env.DEMO_STREAM_PROGRESS_TIMEOUT_MS,
+  120_000,
+);
 
 const defaults = {
-  transport: "nyxid-oauth",
+  transport: "nyxid-session",
   surface: allowedValue(
     process.env.DEMO_DEFAULT_SURFACE,
     ALLOWED_SURFACES,
@@ -43,12 +39,12 @@ const defaults = {
   nyxidBaseUrl: sanitizeBaseUrl(
     process.env.NYXID_BASE_URL || "https://nyx-api.chrono-ai.fun",
   ),
-  oauthClientId: OAUTH_CLIENT_ID,
-  oauthRedirectUri:
-    process.env.NYXID_OAUTH_REDIRECT_URI || `http://127.0.0.1:${PORT}/auth/callback`,
-  oauthScopes:
-    process.env.NYXID_OAUTH_SCOPES ||
-    "openid profile email proxy",
+  nyxidWebUrl: sanitizeBaseUrl(
+    process.env.NYXID_WEB_URL || "https://nyx.chrono-ai.fun",
+  ),
+  sessionCookieName: sanitizeCookieName(
+    process.env.NYXID_SESSION_COOKIE_NAME || "nyx_session",
+  ),
   llmServiceSlug: process.env.NYXID_LLM_SERVICE_SLUG || "chrono-llm-public",
   ornnServiceSlug: process.env.NYXID_ORNN_SERVICE_SLUG || "ornn-api",
   ornnWebUrl: sanitizeBaseUrl(process.env.ORNN_WEB_URL || "https://ornn.chrono-ai.fun"),
@@ -77,6 +73,11 @@ function allowedValue(value, allowed, fallback) {
   return allowed.has(value) ? value : fallback;
 }
 
+function positiveInteger(value, fallback) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function sanitizeBaseUrl(value) {
   const parsed = new URL(String(value).trim());
   if (!new Set(["http:", "https:"]).has(parsed.protocol)) {
@@ -88,18 +89,32 @@ function sanitizeBaseUrl(value) {
   return parsed.toString().replace(/\/$/, "");
 }
 
-function parseCookies(req) {
-  const header = String(req.headers.cookie || "");
-  return Object.fromEntries(header.split(";").flatMap((part) => {
-    const separator = part.indexOf("=");
-    if (separator < 0) return [];
-    const key = part.slice(0, separator).trim();
-    const value = part.slice(separator + 1).trim();
-    return key ? [[key, decodeURIComponent(value)]] : [];
-  }));
+function sanitizeCookieName(value) {
+  const name = String(value || "").trim();
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) {
+    throw new Error("NYXID_SESSION_COOKIE_NAME is invalid.");
+  }
+  return name;
 }
 
-function cookieValue(name, value, { maxAge, secure = false } = {}) {
+function bearerAuthorization(req) {
+  const value = String(req.headers.authorization || "").trim();
+  return /^Bearer [^\s,]+$/i.test(value) ? value : "";
+}
+
+function requestCookie(req, expectedName) {
+  const header = String(req.headers.cookie || "");
+  for (const part of header.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0) continue;
+    const name = part.slice(0, separator).trim();
+    const value = part.slice(separator + 1).trim();
+    if (name === expectedName && value) return value;
+  }
+  return "";
+}
+
+function responseCookie(name, value, { maxAge, secure = false } = {}) {
   const parts = [
     `${name}=${encodeURIComponent(value)}`,
     "Path=/",
@@ -111,26 +126,120 @@ function cookieValue(name, value, { maxAge, secure = false } = {}) {
   return parts.join("; ");
 }
 
-function setCookies(res, values) {
-  res.setHeader("Set-Cookie", values);
-}
-
-function requestSession(req) {
-  const sessionId = parseCookies(req)[SESSION_COOKIE];
-  const session = sessionId ? sessions.get(sessionId) : null;
-  if (!session) return null;
-  if (session.expiresAt <= Date.now()) {
-    sessions.delete(sessionId);
+function jwtExpiryMs(token) {
+  try {
+    const parts = String(token || "").split(".");
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return Number.isFinite(payload.exp) ? Number(payload.exp) * 1000 : null;
+  } catch {
     return null;
   }
-  session.expiresAt = Date.now() + SESSION_TTL_MS;
-  return session;
 }
 
-function requireSession(req) {
-  const session = requestSession(req);
+async function refreshLocalToken(sessionId, session) {
+  const response = await fetch(`${defaults.nyxidBaseUrl}/api/v1/auth/refresh`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ refresh_token: session.refreshToken }),
+    redirect: "manual",
+  });
+  const text = await response.text();
+  const payload = parseJsonOutput(text);
+  if (response.status === 400 || response.status === 401 || response.status === 403) {
+    localTokenSessions.delete(sessionId);
+    return null;
+  }
+  if (!response.ok || !payload?.access_token || !payload?.refresh_token) {
+    throw new HttpError(
+      502,
+      `Unable to refresh the local NyxID session: ${redactMessage(payload?.message || text)}`,
+      "NYXID_TOKEN_REFRESH_FAILED",
+    );
+  }
+  session.accessToken = String(payload.access_token);
+  session.refreshToken = String(payload.refresh_token);
+  session.accessTokenExpiresAt = Date.now() + Number(payload.expires_in || 900) * 1000;
+  session.expiresAt = jwtExpiryMs(session.refreshToken) || Date.now() + LOCAL_TOKEN_SESSION_TTL_MS;
+  return session.accessToken;
+}
+
+async function localSessionAuthorization(req) {
+  const sessionId = requestCookie(req, LOCAL_TOKEN_SESSION_COOKIE);
+  if (!sessionId) return null;
+  const session = localTokenSessions.get(sessionId);
+  if (!session || session.expiresAt <= Date.now()) {
+    localTokenSessions.delete(sessionId);
+    return null;
+  }
+  let accessToken = session.accessToken;
+  if (session.accessTokenExpiresAt <= Date.now() + 60_000) {
+    accessToken = await refreshLocalToken(sessionId, session);
+  }
+  return accessToken ? { authorization: `Bearer ${accessToken}`, localSessionId: sessionId } : null;
+}
+
+async function requestCredential(req) {
+  const authorization = bearerAuthorization(req);
+  if (authorization) return { authorization };
+  const localSession = await localSessionAuthorization(req);
+  if (localSession) return localSession;
+  const siteSession = requestCookie(req, defaults.sessionCookieName);
+  if (siteSession) return { cookie: `${defaults.sessionCookieName}=${siteSession}` };
+  return null;
+}
+
+function credentialHeaders(credential, accept = "application/json") {
+  const headers = { Accept: accept };
+  if (credential?.authorization) headers.Authorization = credential.authorization;
+  if (credential?.cookie) headers.Cookie = credential.cookie;
+  return headers;
+}
+
+async function sessionForCredential(credential) {
+  const response = await fetch(`${defaults.nyxidBaseUrl}/api/v1/users/me`, {
+    headers: credentialHeaders(credential),
+    redirect: "manual",
+  });
+  if (response.status === 401 || response.status === 403) {
+    if (credential.localSessionId) localTokenSessions.delete(credential.localSessionId);
+    return null;
+  }
+  const text = await response.text();
+  const profile = parseJsonOutput(text);
+  if (!response.ok) {
+    throw new HttpError(
+      502,
+      `Unable to validate the NyxID site session: ${redactMessage(profile?.message || text)}`,
+      "NYXID_SESSION_CHECK_FAILED",
+    );
+  }
+  if (!profile?.id) {
+    throw new HttpError(502, "NyxID returned an invalid user profile.", "NYXID_PROFILE_INVALID");
+  }
+  return {
+    credential,
+    user: {
+      id: String(profile.id),
+      name: String(profile.display_name || profile.name || profile.email || "NyxID user"),
+      email: String(profile.email || ""),
+      picture: String(profile.avatar_url || profile.picture || ""),
+    },
+  };
+}
+
+async function requestSession(req) {
+  const credential = await requestCredential(req);
+  return credential ? await sessionForCredential(credential) : null;
+}
+
+async function requireSession(req) {
+  const session = await requestSession(req);
   if (!session) {
-    throw new HttpError(401, "Sign in with NyxID to continue.", "AUTH_REQUIRED");
+    throw new HttpError(401, "Your NyxID site session is required.", "AUTH_REQUIRED");
   }
   return session;
 }
@@ -144,31 +253,33 @@ function assertSameOrigin(req) {
   } catch {
     throw new HttpError(403, "Invalid request origin.", "ORIGIN_REJECTED");
   }
-  if (originHost !== req.headers.host) {
+  const forwardedHost = String(req.headers["x-forwarded-host"] || "").split(",", 1)[0].trim();
+  const requestHost = forwardedHost || req.headers.host;
+  if (originHost !== requestHost) {
     throw new HttpError(403, "Cross-origin request rejected.", "ORIGIN_REJECTED");
   }
 }
 
-function oauthResourceForSlug(slug) {
+function proxyResourceForSlug(slug) {
   return `${defaults.nyxidBaseUrl}/api/v1/proxy/s/${encodeURIComponent(slug)}`;
 }
 
-function requiredOAuthResources() {
+function coreServiceResources() {
   return Array.from(new Set([
     defaults.proxyBaseUrl,
-    oauthResourceForSlug(defaults.llmServiceSlug),
-    oauthResourceForSlug(defaults.ornnServiceSlug),
+    proxyResourceForSlug(defaults.llmServiceSlug),
+    proxyResourceForSlug(defaults.ornnServiceSlug),
   ]));
 }
 
 async function runtimeConfig(body, req) {
-  const session = requireSession(req);
+  const session = await requireSession(req);
   const surface = allowedValue(body.surface, ALLOWED_SURFACES, defaults.surface);
 
   return {
     transport: defaults.transport,
     surface,
-    token: await accessTokenForSession(session),
+    credential: session.credential,
     scopeId: session.user.id,
     workflow: String(body.workflow || defaults.workflow).trim() || "direct",
     directBaseUrl: defaults.directBaseUrl,
@@ -183,9 +294,7 @@ function upstreamUrl(runtime, path) {
 }
 
 function authHeaders(runtime, accept = "application/json") {
-  const headers = { Accept: accept };
-  if (runtime.token) headers.Authorization = `Bearer ${runtime.token}`;
-  return headers;
+  return credentialHeaders(runtime.credential, accept);
 }
 
 async function readJson(req) {
@@ -241,9 +350,12 @@ function redactMessage(value) {
     .slice(0, 1200);
 }
 
-async function fetchRequest(runtime, path, { method = "GET", body, accept } = {}) {
+async function fetchRequest(runtime, path, { method = "GET", body, accept, signal } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 45_000);
+  const requestSignal = signal
+    ? AbortSignal.any([controller.signal, signal])
+    : controller.signal;
   try {
     const headers = authHeaders(runtime, accept || "application/json");
     if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -251,7 +363,7 @@ async function fetchRequest(runtime, path, { method = "GET", body, accept } = {}
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: controller.signal,
+      signal: requestSignal,
       redirect: "manual",
     });
   } finally {
@@ -276,182 +388,13 @@ function resolveRuntimeScope(runtime) {
   return runtime;
 }
 
-function randomToken(size = 32) {
-  return randomBytes(size).toString("base64url");
-}
-
-function pkceChallenge(verifier) {
-  return createHash("sha256").update(verifier).digest("base64url");
-}
-
-function oauthForm(entries, resources = []) {
-  const form = new URLSearchParams();
-  for (const [key, value] of Object.entries(entries)) {
-    if (value !== undefined && value !== null && value !== "") form.set(key, String(value));
-  }
-  resources.forEach((resource) => form.append("resource", resource));
-  return form;
-}
-
-async function oauthTokenRequest(entries, resources = []) {
-  const response = await fetch(`${defaults.nyxidBaseUrl}/oauth/token`, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: oauthForm(entries, resources),
-    redirect: "manual",
-  });
-  const text = await response.text();
-  const payload = parseJsonOutput(text);
-  if (!response.ok || !payload?.access_token) {
-    const message = payload?.error_description || payload?.message || payload?.error || text;
-    throw new HttpError(
-      response.status === 400 ? 401 : 502,
-      `NyxID token exchange failed: ${redactMessage(message)}`,
-      "OAUTH_TOKEN_EXCHANGE_FAILED",
-    );
-  }
-  return payload;
-}
-
-function decodeJwtPart(value) {
-  try {
-    return JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
-  } catch {
-    throw new HttpError(401, "NyxID returned an invalid token.", "OAUTH_TOKEN_INVALID");
-  }
-}
-
-function decodeJwt(token) {
-  const parts = String(token || "").split(".");
-  if (parts.length !== 3) {
-    throw new HttpError(401, "NyxID returned an invalid token.", "OAUTH_TOKEN_INVALID");
-  }
-  return {
-    header: decodeJwtPart(parts[0]),
-    payload: decodeJwtPart(parts[1]),
-    signingInput: `${parts[0]}.${parts[1]}`,
-    signature: Buffer.from(parts[2], "base64url"),
-  };
-}
-
-async function getJwks(forceRefresh = false) {
-  if (!forceRefresh && jwksCache?.expiresAt > Date.now()) return jwksCache.value;
-  const response = await fetch(`${defaults.nyxidBaseUrl}/.well-known/jwks.json`, {
-    headers: { Accept: "application/json" },
-  });
-  if (!response.ok) {
-    throw new HttpError(502, "Unable to verify the NyxID login response.", "OAUTH_JWKS_FAILED");
-  }
-  const value = await response.json();
-  jwksCache = { value, expiresAt: Date.now() + 60 * 60 * 1000 };
-  return value;
-}
-
-async function verifyIdToken(token, expectedNonce) {
-  const decoded = decodeJwt(token);
-  if (decoded.header.alg !== "RS256" || !decoded.header.kid) {
-    throw new HttpError(401, "NyxID ID token uses an unsupported signature.", "OAUTH_ID_TOKEN_INVALID");
-  }
-  let jwks = await getJwks();
-  let jwk = jwks.keys?.find((candidate) => candidate.kid === decoded.header.kid);
-  if (!jwk) {
-    jwks = await getJwks(true);
-    jwk = jwks.keys?.find((candidate) => candidate.kid === decoded.header.kid);
-    if (!jwk) {
-      throw new HttpError(401, "NyxID ID token signing key was not found.", "OAUTH_ID_TOKEN_INVALID");
-    }
-  }
-  const valid = verify(
-    "RSA-SHA256",
-    Buffer.from(decoded.signingInput),
-    createPublicKey({ key: jwk, format: "jwk" }),
-    decoded.signature,
-  );
-  const audience = Array.isArray(decoded.payload.aud)
-    ? decoded.payload.aud
-    : [decoded.payload.aud];
-  const now = Math.floor(Date.now() / 1000);
-  if (!valid || decoded.payload.iss !== defaults.nyxidBaseUrl ||
-      !audience.includes(defaults.oauthClientId) || decoded.payload.exp <= now - 30 ||
-      decoded.payload.iat > now + 60 || decoded.payload.nonce !== expectedNonce) {
-    throw new HttpError(401, "NyxID ID token validation failed.", "OAUTH_ID_TOKEN_INVALID");
-  }
-  return decoded.payload;
-}
-
-async function fetchUserInfo(accessToken) {
-  const response = await fetch(`${defaults.nyxidBaseUrl}/oauth/userinfo`, {
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${accessToken}`,
-    },
-  });
-  const payload = await response.json().catch(() => null);
-  if (!response.ok || !payload?.sub) {
-    throw new HttpError(401, "Unable to read the authorized NyxID account.", "OAUTH_USERINFO_FAILED");
-  }
-  return payload;
-}
-
-async function fetchClientConsentResources(accessToken) {
-  const authHeaders = {
-    Accept: "application/json",
-    Authorization: `Bearer ${accessToken}`,
-  };
-  const consentResponse = await fetch(`${defaults.nyxidBaseUrl}/api/v1/users/me/consents`, {
-    headers: authHeaders,
-  });
-  if (!consentResponse.ok) return [];
-  const consentPayload = await consentResponse.json().catch(() => null);
-  const consents = Array.isArray(consentPayload?.consents)
-    ? consentPayload.consents
-    : Array.isArray(consentPayload)
-      ? consentPayload
-      : [];
-  const consent = consents.find((item) => item.client_id === defaults.oauthClientId);
-  if (!consent) return [];
-  if (consent.allow_all_services || consent.legacy_unrestricted) {
-    const servicesResponse = await fetch(`${defaults.nyxidBaseUrl}/api/v1/user-services`, {
-      headers: authHeaders,
-    });
-    if (!servicesResponse.ok) return [];
-    const servicesPayload = await servicesResponse.json().catch(() => null);
-    return (servicesPayload?.services || [])
-      .filter((service) => service.is_active !== false && service.credential_source?.allowed !== false)
-      .map((service) => service.resource_uri || oauthResourceForSlug(service.slug))
-      .filter(Boolean);
-  }
-  return (Array.isArray(consent.allowed_services) ? consent.allowed_services : [])
-    .filter((service) => !service.deleted && service.slug)
-    .map((service) => oauthResourceForSlug(service.slug));
-}
-
-async function accessTokenForSession(session) {
-  if (session.accessToken && session.accessTokenExpiresAt > Date.now() + 60_000) {
-    return session.accessToken;
-  }
-  const tokens = await oauthTokenRequest({
-    grant_type: TOKEN_EXCHANGE_GRANT,
-    client_id: defaults.oauthClientId,
-    subject_token: session.bindingId,
-    subject_token_type: BROKER_SUBJECT_TOKEN_TYPE,
-    scope: "openid profile email proxy",
-  });
-  session.accessToken = tokens.access_token;
-  session.accessTokenExpiresAt = Date.now() + Number(tokens.expires_in || 300) * 1000;
-  return session.accessToken;
-}
-
-async function nyxidApiRequest(session, path) {
-  const token = await accessTokenForSession(session);
+async function nyxidApiRequest(session, path, { method = "GET", body } = {}) {
+  const headers = credentialHeaders(session.credential);
+  if (body !== undefined) headers["Content-Type"] = "application/json";
   const response = await fetch(`${defaults.nyxidBaseUrl}${path}`, {
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${token}`,
-    },
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
     redirect: "manual",
   });
   const text = await response.text();
@@ -464,19 +407,20 @@ async function nyxidApiRequest(session, path) {
 
 async function listNyxidServices(session) {
   const payload = await nyxidApiRequest(session, "/api/v1/user-services");
-  const authorized = new Set(session.resources || []);
-  const coreResources = new Set(requiredOAuthResources());
+  const coreResources = new Set(coreServiceResources());
   return (Array.isArray(payload?.services) ? payload.services : [])
     .map((service) => {
-      const resourceUri = String(service.resource_uri || oauthResourceForSlug(service.slug || ""));
+      const resourceUri = String(service.resource_uri || proxyResourceForSlug(service.slug || ""));
+      const active = service.is_active !== false;
+      const available = service.credential_source?.allowed !== false;
       return {
         id: String(service.id || ""),
         slug: String(service.slug || ""),
         label: String(service.label || service.catalog_service_name || service.slug || "Service"),
         resourceUri,
-        active: service.is_active !== false,
-        available: service.credential_source?.allowed !== false,
-        authorized: authorized.has(resourceUri),
+        active,
+        available,
+        authorized: active && available,
         core: coreResources.has(resourceUri),
         source: service.credential_source?.type || "personal",
         sourceName: service.credential_source?.org_name || "",
@@ -493,200 +437,143 @@ function sessionPayload(session) {
   if (!session) return { authenticated: false };
   return {
     authenticated: true,
+    authMode: "site-session",
     user: session.user,
     scopeId: session.user.id,
-    resources: session.resources,
-    expiresAt: new Date(session.expiresAt).toISOString(),
+    resources: [],
   };
 }
 
-async function beginAuthorization(req, res, requestedServiceIds = []) {
-  const session = requestedServiceIds.length ? requireSession(req) : requestSession(req);
-  const resources = new Set(
-    session?.consentResources?.length
-      ? session.consentResources
-      : session?.resources || [],
-  );
-  requiredOAuthResources().forEach((resource) => resources.add(resource));
+function requestOrigin(req) {
+  const forwardedProtocol = String(req.headers["x-forwarded-proto"] || "").split(",", 1)[0].trim();
+  const protocol = forwardedProtocol || (req.socket.encrypted ? "https" : "http");
+  const forwardedHost = String(req.headers["x-forwarded-host"] || "").split(",", 1)[0].trim();
+  const host = forwardedHost || String(req.headers.host || "localhost");
+  return `${protocol}://${host}`;
+}
 
-  if (requestedServiceIds.length) {
-    const services = await listNyxidServices(session);
-    const requested = new Set(requestedServiceIds);
-    const matches = services.filter((service) => requested.has(service.id));
-    if (matches.length !== requested.size) {
-      throw new HttpError(400, "One or more NyxID services are unavailable.", "SERVICE_NOT_FOUND");
-    }
-    for (const service of matches) {
-      if (!service.active || !service.available) {
-        throw new HttpError(403, `${service.label} is not available to this account.`, "SERVICE_UNAVAILABLE");
-      }
-      resources.add(service.resourceUri);
+function loginReturnUrl(req, requestUrl) {
+  const siteOrigin = new URL(defaults.nyxidWebUrl).origin;
+  const candidates = [
+    requestUrl.searchParams.get("return_to"),
+    String(req.headers.referer || ""),
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      const parsed = new URL(candidate, `${siteOrigin}/`);
+      if (parsed.origin === siteOrigin) return parsed.toString();
+    } catch {
+      // Ignore malformed return targets.
     }
   }
+  const origin = requestOrigin(req);
+  return origin === siteOrigin ? `${origin}/` : "";
+}
 
-  const state = randomToken();
-  const verifier = randomToken(48);
-  const nonce = randomToken();
-  const record = {
-    createdAt: Date.now(),
-    verifier,
-    nonce,
-    resources: Array.from(resources),
-    sessionId: session?.id || null,
-    incremental: requestedServiceIds.length > 0,
-  };
-  oauthStates.set(state, record);
+function handleLoginRedirect(req, res, routeUrl) {
+  const requestUrl = new URL(requestOrigin(req));
+  const siteOrigin = new URL(defaults.nyxidWebUrl).origin;
+  if (requestUrl.origin !== siteOrigin) {
+    const loopback = new Set(["127.0.0.1", "localhost", "[::1]", "::1"])
+      .has(requestUrl.hostname);
+    const port = Number.parseInt(requestUrl.port, 10);
+    if (!loopback || !Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new HttpError(
+        409,
+        "NyxID site sessions require same-origin deployment; token handoff is limited to localhost.",
+        "SITE_SESSION_ORIGIN_REQUIRED",
+      );
+    }
+    const state = randomBytes(32).toString("base64url");
+    loginHandoffs.set(state, { createdAt: Date.now() });
+    const handoffUrl = new URL("/cli-auth", defaults.nyxidWebUrl);
+    handoffUrl.searchParams.set("port", String(port));
+    handoffUrl.searchParams.set("state", state);
+    handoffUrl.searchParams.set("client_ua", "nyxid-assistant");
+    res.writeHead(302, { Location: handoffUrl.toString(), "Cache-Control": "no-store" });
+    res.end();
+    return;
+  }
 
-  const authorizeUrl = new URL("/oauth/authorize", defaults.nyxidBaseUrl);
-  authorizeUrl.searchParams.set("response_type", "code");
-  authorizeUrl.searchParams.set("client_id", defaults.oauthClientId);
-  authorizeUrl.searchParams.set("redirect_uri", defaults.oauthRedirectUri);
-  authorizeUrl.searchParams.set("scope", defaults.oauthScopes);
-  authorizeUrl.searchParams.set("state", state);
-  authorizeUrl.searchParams.set("nonce", nonce);
-  authorizeUrl.searchParams.set("code_challenge", pkceChallenge(verifier));
-  authorizeUrl.searchParams.set("code_challenge_method", "S256");
-  if (record.incremental) authorizeUrl.searchParams.set("prompt", "consent");
-  record.resources.forEach((resource) => authorizeUrl.searchParams.append("resource", resource));
-
-  const secure = new URL(defaults.oauthRedirectUri).protocol === "https:";
-  setCookies(res, [cookieValue(OAUTH_STATE_COOKIE, state, {
-    maxAge: OAUTH_STATE_TTL_MS / 1000,
-    secure,
-  })]);
-  res.writeHead(302, { Location: authorizeUrl.toString(), "Cache-Control": "no-store" });
+  const loginUrl = new URL("/login", defaults.nyxidWebUrl);
+  const returnTo = loginReturnUrl(req, routeUrl);
+  if (returnTo) loginUrl.searchParams.set("return_to", returnTo);
+  res.writeHead(302, { Location: loginUrl.toString(), "Cache-Control": "no-store" });
   res.end();
 }
 
-async function revokeBinding(bindingId) {
-  if (!bindingId) return;
-  await fetch(`${defaults.nyxidBaseUrl}/oauth/revoke`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: oauthForm({
-      token: bindingId,
-      token_type_hint: BROKER_SUBJECT_TOKEN_TYPE,
-      client_id: defaults.oauthClientId,
+async function handleTokenCallback(res, requestUrl) {
+  const state = requestUrl.searchParams.get("state") || "";
+  const handoff = loginHandoffs.get(state);
+  loginHandoffs.delete(state);
+  if (!handoff || Date.now() - handoff.createdAt > LOGIN_HANDOFF_TTL_MS) {
+    throw new HttpError(400, "NyxID login handoff expired or is invalid.", "LOGIN_HANDOFF_INVALID");
+  }
+
+  const accessToken = requestUrl.searchParams.get("access_token") || "";
+  const refreshToken = requestUrl.searchParams.get("refresh_token") || "";
+  if (!accessToken || !refreshToken || accessToken.length > 16_384 || refreshToken.length > 16_384) {
+    throw new HttpError(400, "NyxID login handoff did not return valid tokens.", "LOGIN_HANDOFF_INVALID");
+  }
+
+  const credential = { authorization: `Bearer ${accessToken}` };
+  const verified = await sessionForCredential(credential);
+  if (!verified) {
+    throw new HttpError(401, "NyxID login handoff could not be verified.", "LOGIN_HANDOFF_INVALID");
+  }
+
+  const sessionId = randomBytes(32).toString("base64url");
+  const expiresAt = jwtExpiryMs(refreshToken) || Date.now() + LOCAL_TOKEN_SESSION_TTL_MS;
+  localTokenSessions.set(sessionId, {
+    accessToken,
+    refreshToken,
+    accessTokenExpiresAt: jwtExpiryMs(accessToken) || Date.now() + 15 * 60 * 1000,
+    expiresAt,
+  });
+  res.writeHead(303, {
+    Location: "/",
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "Set-Cookie": responseCookie(LOCAL_TOKEN_SESSION_COOKIE, sessionId, {
+      maxAge: Math.max(1, Math.floor((expiresAt - Date.now()) / 1000)),
     }),
   });
-}
-
-function callbackHtml(status, message) {
-  const nonce = randomToken(18);
-  const payload = JSON.stringify({ type: "nyxid-oauth", status, message })
-    .replaceAll("<", "\\u003c");
-  return {
-    nonce,
-    body: `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>NyxID authorization</title></head><body><p>${status === "success" ? "授权完成，可以关闭此窗口。" : "授权未完成，请返回 NyxID Chat。"}</p><script nonce="${nonce}">const result=${payload};if(window.opener){window.opener.postMessage(result,window.location.origin);window.close()}else{setTimeout(()=>location.replace('/'),400)}</script></body></html>`,
-  };
-}
-
-function sendCallbackPage(res, status, message, cookies = []) {
-  const page = callbackHtml(status, message);
-  const headers = {
-    "Content-Type": "text/html; charset=utf-8",
-    "Content-Length": Buffer.byteLength(page.body),
-    "Cache-Control": "no-store",
-    "Content-Security-Policy": `default-src 'none'; script-src 'nonce-${page.nonce}'; style-src 'none'; base-uri 'none'; frame-ancestors 'none'`,
-    "X-Content-Type-Options": "nosniff",
-  };
-  if (cookies.length) headers["Set-Cookie"] = cookies;
-  res.writeHead(status === "success" ? 200 : 400, headers);
-  res.end(page.body);
-}
-
-async function handleOAuthCallback(req, res, requestUrl) {
-  const returnedState = requestUrl.searchParams.get("state") || "";
-  const stateCookie = parseCookies(req)[OAUTH_STATE_COOKIE] || "";
-  const record = oauthStates.get(returnedState);
-  oauthStates.delete(returnedState);
-  const secure = new URL(defaults.oauthRedirectUri).protocol === "https:";
-  const clearStateCookie = cookieValue(OAUTH_STATE_COOKIE, "", { maxAge: 0, secure });
-
-  if (!record || returnedState !== stateCookie || Date.now() - record.createdAt > OAUTH_STATE_TTL_MS) {
-    sendCallbackPage(res, "error", "OAuth state validation failed.", [clearStateCookie]);
-    return;
-  }
-  if (requestUrl.searchParams.get("error")) {
-    const detail = requestUrl.searchParams.get("error_description") || requestUrl.searchParams.get("error");
-    sendCallbackPage(res, "error", redactMessage(detail), [clearStateCookie]);
-    return;
-  }
-  const code = requestUrl.searchParams.get("code");
-  if (!code) {
-    sendCallbackPage(res, "error", "NyxID did not return an authorization code.", [clearStateCookie]);
-    return;
-  }
-
-  let issuedBindingId = "";
-  try {
-    const tokens = await oauthTokenRequest({
-      grant_type: "authorization_code",
-      code,
-      client_id: defaults.oauthClientId,
-      redirect_uri: defaults.oauthRedirectUri,
-      code_verifier: record.verifier,
-    });
-    if (!tokens.id_token || !tokens.binding_id) {
-      throw new HttpError(502, "NyxID did not return the required broker binding.", "OAUTH_BINDING_MISSING");
-    }
-    issuedBindingId = tokens.binding_id;
-    const idClaims = await verifyIdToken(tokens.id_token, record.nonce);
-    const userInfo = await fetchUserInfo(tokens.access_token);
-    if (idClaims.sub !== userInfo.sub) {
-      throw new HttpError(401, "NyxID subject validation failed.", "OAUTH_SUBJECT_MISMATCH");
-    }
-    const accessClaims = decodeJwt(tokens.access_token).payload;
-    const grantedResources = Array.isArray(tokens.resource)
-      ? tokens.resource
-      : Array.isArray(accessClaims.resources)
-        ? accessClaims.resources
-        : [];
-    const consentResources = await fetchClientConsentResources(tokens.access_token)
-      .catch(() => []);
-    const requestCookieSessionId = parseCookies(req)[SESSION_COOKIE];
-    const previous = record.sessionId && record.sessionId === requestCookieSessionId
-      ? sessions.get(record.sessionId)
-      : null;
-    const sessionId = previous?.id || randomToken();
-    const session = {
-      id: sessionId,
-      user: {
-        id: String(userInfo.sub),
-        name: String(userInfo.name || userInfo.email || "NyxID user"),
-        email: String(userInfo.email || ""),
-        picture: String(userInfo.picture || ""),
-      },
-      bindingId: tokens.binding_id,
-      accessToken: tokens.access_token,
-      accessTokenExpiresAt: Date.now() + Number(tokens.expires_in || 300) * 1000,
-      resources: Array.from(new Set(grantedResources)),
-      consentResources: Array.from(new Set([...consentResources, ...grantedResources])),
-      createdAt: previous?.createdAt || Date.now(),
-      expiresAt: Date.now() + SESSION_TTL_MS,
-    };
-    sessions.set(sessionId, session);
-    if (previous?.bindingId && previous.bindingId !== session.bindingId) {
-      void revokeBinding(previous.bindingId).catch(() => {});
-    }
-    sendCallbackPage(res, "success", record.incremental ? "Service access updated." : "Signed in.", [
-      cookieValue(SESSION_COOKIE, sessionId, { maxAge: SESSION_TTL_MS / 1000, secure }),
-      clearStateCookie,
-    ]);
-  } catch (error) {
-    if (issuedBindingId) void revokeBinding(issuedBindingId).catch(() => {});
-    sendCallbackPage(res, "error", redactMessage(error.message), [clearStateCookie]);
-  }
+  res.end();
 }
 
 async function handleLogout(req, res) {
-  const session = requestSession(req);
-  if (session) {
-    sessions.delete(session.id);
-    await revokeBinding(session.bindingId).catch(() => {});
+  const localSessionId = requestCookie(req, LOCAL_TOKEN_SESSION_COOKIE);
+  const session = await requestSession(req);
+  if (!session) {
+    if (localSessionId) {
+      localTokenSessions.delete(localSessionId);
+      res.setHeader("Set-Cookie", responseCookie(LOCAL_TOKEN_SESSION_COOKIE, "", { maxAge: 0 }));
+    }
+    json(res, 200, { ok: true });
+    return;
   }
-  const secure = new URL(defaults.oauthRedirectUri).protocol === "https:";
-  setCookies(res, [cookieValue(SESSION_COOKIE, "", { maxAge: 0, secure })]);
+  const response = await fetch(`${defaults.nyxidBaseUrl}/api/v1/auth/logout`, {
+    method: "POST",
+    headers: credentialHeaders(session.credential),
+    redirect: "manual",
+  });
+  if (!response.ok && response.status !== 401) {
+    const text = await response.text();
+    throw new HttpError(
+      502,
+      `Unable to end the NyxID site session: ${redactMessage(text)}`,
+      "NYXID_LOGOUT_FAILED",
+    );
+  }
+  const setCookie = typeof response.headers.getSetCookie === "function"
+    ? response.headers.getSetCookie()
+    : [response.headers.get("set-cookie")].filter(Boolean);
+  if (localSessionId) {
+    localTokenSessions.delete(localSessionId);
+    setCookie.push(responseCookie(LOCAL_TOKEN_SESSION_COOKIE, "", { maxAge: 0 }));
+  }
+  if (setCookie.length) res.setHeader("Set-Cookie", setCookie);
   json(res, 200, { ok: true });
 }
 
@@ -774,45 +661,98 @@ function parseJsonOutput(text) {
   }
 }
 
-async function pipeFetchStream(req, res, runtime, path, options, prefixFrames = []) {
-  const upstream = await fetchRequest(runtime, path, {
-    ...options,
-    accept: "text/event-stream",
-  });
-  const correlationId = upstream.headers.get("x-correlation-id");
-  if (!upstream.ok) {
-    const text = await upstream.text();
-    res.writeHead(upstream.status, {
-      "Content-Type": upstream.headers.get("content-type") || "application/json; charset=utf-8",
-      "Cache-Control": "no-store",
-    });
-    res.end(text);
-    return;
-  }
-
-  startSse(res, correlationId ? { "X-Correlation-Id": correlationId } : {});
-  prefixFrames.forEach((frame) => writeSse(res, frame));
-  if (!upstream.body) {
-    res.end();
-    return;
-  }
-
-  const controller = new AbortController();
-  req.once("aborted", () => controller.abort());
+function isKeepaliveEvent(event) {
+  if (/keepalive|heartbeat|ping/i.test(String(event?.event || ""))) return true;
+  if (!event?.data || event.data === "[DONE]") return false;
   try {
-    for await (const chunk of upstream.body) {
-      if (res.destroyed || controller.signal.aborted) break;
-      res.write(chunk);
-    }
-  } catch (error) {
-    if (!res.destroyed) {
-      writeSse(res, {
-        type: "RUN_ERROR",
-        runError: { message: redactMessage(error.message) },
+    const normalized = normalizeFrame(JSON.parse(event.data));
+    return normalized.type === "keepalive" ||
+      /keepalive|heartbeat/i.test(String(normalized.name || ""));
+  } catch {
+    return false;
+  }
+}
+
+async function pipeFetchStream(req, res, runtime, path, options, prefixFrames = []) {
+  const controller = new AbortController();
+  const abortUpstream = () => {
+    if (!controller.signal.aborted) controller.abort();
+  };
+  req.once("aborted", abortUpstream);
+  res.once("close", abortUpstream);
+
+  let progressTimer = null;
+  let progressTimedOut = false;
+  try {
+    const upstream = await fetchRequest(runtime, path, {
+      ...options,
+      accept: "text/event-stream",
+      signal: controller.signal,
+    });
+    const correlationId = upstream.headers.get("x-correlation-id");
+    if (!upstream.ok) {
+      const text = await upstream.text();
+      res.writeHead(upstream.status, {
+        "Content-Type": upstream.headers.get("content-type") || "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
       });
+      res.end(text);
+      return;
+    }
+
+    startSse(res, correlationId ? { "X-Correlation-Id": correlationId } : {});
+    prefixFrames.forEach((frame) => writeSse(res, frame));
+    if (!upstream.body) {
+      res.end();
+      return;
+    }
+
+    const decoder = new TextDecoder();
+    let eventBuffer = "";
+    const resetProgressTimer = () => {
+      clearTimeout(progressTimer);
+      progressTimer = setTimeout(() => {
+        progressTimedOut = true;
+        writeSse(res, {
+          type: "RUN_ERROR",
+          runError: {
+            code: "UPSTREAM_PROGRESS_TIMEOUT",
+            message: `上游 Agent 连续 ${Math.ceil(STREAM_PROGRESS_TIMEOUT_MS / 1000)} 秒没有返回有效进度，已停止等待。`,
+            ...(correlationId ? { correlationId } : {}),
+          },
+        });
+        if (!res.writableEnded) res.end();
+        abortUpstream();
+      }, STREAM_PROGRESS_TIMEOUT_MS);
+      progressTimer.unref?.();
+    };
+    resetProgressTimer();
+
+    try {
+      for await (const chunk of upstream.body) {
+        if (res.destroyed || controller.signal.aborted) break;
+        eventBuffer += decoder.decode(chunk, { stream: true });
+        const parsed = extractSseEvents(eventBuffer, false);
+        eventBuffer = parsed.rest;
+        if (parsed.events.some((event) => !isKeepaliveEvent(event))) {
+          resetProgressTimer();
+        }
+        res.write(chunk);
+      }
+    } catch (error) {
+      if (!progressTimedOut && !controller.signal.aborted && !res.destroyed) {
+        writeSse(res, {
+          type: "RUN_ERROR",
+          runError: { message: redactMessage(error.message) },
+        });
+      }
     }
   } finally {
-    if (!res.writableEnded) res.end();
+    clearTimeout(progressTimer);
+    req.off("aborted", abortUpstream);
+    res.off("close", abortUpstream);
+    abortUpstream();
+    if (!res.writableEnded && !res.destroyed) res.end();
   }
 }
 
@@ -1008,29 +948,19 @@ async function handleHealth(req, res, body) {
       };
     }
   };
-  const ornnResource = oauthResourceForSlug(defaults.ornnServiceSlug);
-  const ornnAuthorized = runtime.session.resources.includes(ornnResource);
+  const ornnResource = proxyResourceForSlug(defaults.ornnServiceSlug);
   const aevatarPromise = checkService(
     runtime,
     "/api/capabilities",
-    "Aevatar responded through the authorized NyxID proxy route.",
+    "Aevatar responded through the NyxID site session.",
   );
-  const ornnPromise = ornnAuthorized
-    ? checkService(
-      { ...runtime, proxyBaseUrl: ornnResource },
-      "/api/v1/skill-search?query=aevatar&mode=keyword&scope=mixed&page=1&pageSize=1",
-      "Ornn skill search responded through the authorized NyxID proxy route.",
-    )
-    : Promise.resolve({
-      ok: false,
-      authorized: false,
-      status: "authorization-required",
-      latencyMs: 0,
-      detail: "Authorize ornn-api when this chat needs Ornn skills.",
-      serviceSlug: defaults.ornnServiceSlug,
-    });
+  const ornnPromise = checkService(
+    { ...runtime, proxyBaseUrl: ornnResource },
+    "/api/v1/skill-search?query=aevatar&mode=keyword&scope=mixed&page=1&pageSize=1",
+    "Ornn skill search responded through the NyxID site session.",
+  );
   const [aevatar, ornn] = await Promise.all([aevatarPromise, ornnPromise]);
-  const ok = aevatar.ok && (!ornnAuthorized || ornn.ok);
+  const ok = aevatar.ok && ornn.ok;
   const detail = [
     `Aevatar: ${aevatar.detail}`,
     `Ornn: ${ornn.detail}`,
@@ -1084,24 +1014,27 @@ const server = createServer(async (req, res) => {
     if (!new Set(["GET", "HEAD", "OPTIONS"]).has(req.method || "GET")) {
       assertSameOrigin(req);
     }
+    if (req.method === "GET" && requestUrl.pathname === "/callback") {
+      await handleTokenCallback(res, requestUrl);
+      return;
+    }
     if (req.method === "GET" && requestUrl.pathname === "/api/auth/login") {
-      await beginAuthorization(req, res);
+      handleLoginRedirect(req, res, requestUrl);
       return;
     }
     if (req.method === "GET" && requestUrl.pathname === "/api/auth/authorize") {
-      await beginAuthorization(req, res, requestUrl.searchParams.getAll("serviceId"));
-      return;
-    }
-    if (req.method === "GET" && requestUrl.pathname === "/auth/callback") {
-      await handleOAuthCallback(req, res, requestUrl);
-      return;
+      throw new HttpError(
+        410,
+        "Developer-app consent is not used by the NyxID site integration.",
+        "DEVELOPER_APP_AUTH_REMOVED",
+      );
     }
     if (req.method === "GET" && requestUrl.pathname === "/api/auth/session") {
-      json(res, 200, sessionPayload(requestSession(req)));
+      json(res, 200, sessionPayload(await requestSession(req)));
       return;
     }
     if (req.method === "GET" && requestUrl.pathname === "/api/auth/services") {
-      const session = requireSession(req);
+      const session = await requireSession(req);
       json(res, 200, { services: await listNyxidServices(session) });
       return;
     }
@@ -1110,7 +1043,7 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (req.method === "GET" && requestUrl.pathname === "/api/demo/config") {
-      const session = requestSession(req);
+      const session = await requestSession(req);
       json(res, 200, {
         transport: defaults.transport,
         surface: defaults.surface,
@@ -1118,10 +1051,12 @@ const server = createServer(async (req, res) => {
         directBaseUrl: defaults.directBaseUrl,
         proxyBaseUrl: defaults.proxyBaseUrl,
         ornnWebUrl: defaults.ornnWebUrl,
-        scopeId: session?.user.id || "",
+        nyxidWebUrl: defaults.nyxidWebUrl,
+        servicesUrl: new URL("/keys", defaults.nyxidWebUrl).toString(),
+        scopeId: session?.user?.id || "",
         environment: "production",
         transportLocked: true,
-        oauthConfigured: Boolean(defaults.oauthClientId && defaults.oauthRedirectUri),
+        authMode: "site-session",
       });
       return;
     }
@@ -1172,19 +1107,16 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  process.stdout.write(`NyxID Aevatar chat: http://${HOST}:${PORT}\n`);
+  process.stdout.write(`NyxID Assistant (site session): http://${HOST}:${PORT}\n`);
 });
 
 setInterval(() => {
   const now = Date.now();
-  for (const [id, session] of sessions) {
-    if (session.expiresAt <= now) {
-      sessions.delete(id);
-      void revokeBinding(session.bindingId).catch(() => {});
-    }
+  for (const [state, handoff] of loginHandoffs) {
+    if (now - handoff.createdAt > LOGIN_HANDOFF_TTL_MS) loginHandoffs.delete(state);
   }
-  for (const [state, record] of oauthStates) {
-    if (now - record.createdAt > OAUTH_STATE_TTL_MS) oauthStates.delete(state);
+  for (const [sessionId, session] of localTokenSessions) {
+    if (session.expiresAt <= now) localTokenSessions.delete(sessionId);
   }
 }, 60_000).unref();
 

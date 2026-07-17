@@ -87,7 +87,8 @@ test("NyxID Chat keeps concurrent conversation streams isolated and switchable",
     const method = String(init.method || "GET").toUpperCase();
     if (url.pathname === "/api/demo/config") {
       return jsonResponse({
-        transport: "nyxid-oauth",
+        transport: "nyxid-session",
+        authMode: "site-session",
         surface: "nyxid-chat",
         workflow: "direct",
         scopeId: "user-1",

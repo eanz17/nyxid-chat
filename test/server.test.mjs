@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { generateKeyPairSync, sign } from "node:crypto";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
 
@@ -24,8 +23,6 @@ async function startServer(t, extraEnv = {}) {
       ...process.env,
       HOST: "127.0.0.1",
       PORT: String(port),
-      NYXID_OAUTH_CLIENT_ID: "test-client",
-      NYXID_OAUTH_REDIRECT_URI: `http://127.0.0.1:${port}/auth/callback`,
       ...extraEnv,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -43,29 +40,31 @@ async function startServer(t, extraEnv = {}) {
   return { baseUrl: `http://127.0.0.1:${port}`, port };
 }
 
-function json(res, status, payload) {
+function json(res, status, payload, extraHeaders = {}) {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Content-Length": Buffer.byteLength(body),
+    ...extraHeaders,
   });
   res.end(body);
 }
 
-function signedJwt(privateKey, kid, payload) {
-  const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT", kid })).toString("base64url");
-  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
-  const signature = sign("RSA-SHA256", Buffer.from(`${header}.${body}`), privateKey).toString("base64url");
-  return `${header}.${body}.${signature}`;
+function sse(res, frame) {
+  res.write(`data: ${JSON.stringify(frame)}\n\n`);
 }
 
 async function startMockNyxId(t) {
   const port = await freePort();
   const baseUrl = `http://127.0.0.1:${port}`;
-  const kid = "test-key";
-  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
-  const publicJwk = { ...publicKey.export({ format: "jwk" }), kid, alg: "RS256", use: "sig" };
-  const state = { nonce: "", revocations: 0 };
+  const state = {
+    authHeaders: [],
+    logoutRequests: 0,
+    proxyAuthorizations: [],
+    proxyCookies: [],
+    streamAborts: 0,
+    streamScenario: "keepalive-only",
+  };
   const resources = {
     aevatar: `${baseUrl}/api/v1/proxy/s/aevatar`,
     llm: `${baseUrl}/api/v1/proxy/s/chrono-llm-public`,
@@ -109,84 +108,111 @@ async function startMockNyxId(t) {
 
   const server = createHttpServer((req, res) => {
     const url = new URL(req.url || "/", baseUrl);
-    if (req.method === "GET" && url.pathname === "/.well-known/jwks.json") {
-      json(res, 200, { keys: [publicJwk] });
-      return;
+    const authenticated = req.headers.cookie === "nyx_session=test-session" ||
+      req.headers.authorization === "Bearer test-access-token";
+    if (url.pathname.startsWith("/api/v1/proxy/")) {
+      state.proxyCookies.push(req.headers.cookie || "");
+      state.proxyAuthorizations.push(req.headers.authorization || "");
+      if (!authenticated) {
+        json(res, 401, { message: "not authenticated" });
+        return;
+      }
     }
-    if (req.method === "POST" && url.pathname === "/oauth/token") {
-      const chunks = [];
-      req.on("data", (chunk) => chunks.push(chunk));
-      req.on("end", () => {
-        const form = new URLSearchParams(Buffer.concat(chunks).toString("utf8"));
-        const now = Math.floor(Date.now() / 1000);
-        const accessToken = signedJwt(privateKey, kid, {
-          sub: "user-1",
-          iss: baseUrl,
-          aud: baseUrl,
-          exp: now + 300,
-          iat: now,
-          token_type: "access",
-          scope: "openid profile email proxy",
-          resources: [resources.aevatar, resources.llm, resources.ornn],
-          allowed_service_ids: ["svc-aevatar", "svc-llm", "svc-ornn"],
-          allow_all_services: false,
-        });
-        if (form.get("grant_type") === "authorization_code") {
-          json(res, 200, {
-            access_token: accessToken,
-            token_type: "Bearer",
-            expires_in: 300,
-            scope: "openid profile email proxy",
-            resource: [resources.aevatar, resources.llm, resources.ornn],
-            binding_id: "bnd_test-binding",
-            id_token: signedJwt(privateKey, kid, {
-              sub: "user-1",
-              iss: baseUrl,
-              aud: "test-client",
-              exp: now + 3600,
-              iat: now,
-              nonce: state.nonce,
-            }),
-          });
-          return;
-        }
-        json(res, 200, {
-          access_token: accessToken,
-          token_type: "Bearer",
-          expires_in: 300,
-          scope: "openid profile email proxy",
-        });
+    if (req.method === "GET" && url.pathname === "/api/v1/users/me") {
+      state.authHeaders.push({
+        path: url.pathname,
+        authorization: req.headers.authorization || "",
+        cookie: req.headers.cookie || "",
+      });
+      if (!authenticated) {
+        json(res, 401, { message: "not authenticated" });
+        return;
+      }
+      json(res, 200, {
+        id: "user-1",
+        display_name: "Test User",
+        email: "test@example.com",
+        avatar_url: "",
       });
       return;
     }
-    if (req.method === "GET" && url.pathname === "/oauth/userinfo") {
-      json(res, 200, { sub: "user-1", name: "Test User", email: "test@example.com" });
-      return;
-    }
-    if (req.method === "GET" && url.pathname === "/api/v1/users/me/consents") {
-      json(res, 200, {
-        consents: [{
-          client_id: "test-client",
-          scopes: "openid profile email proxy",
-          allow_all_services: false,
-          legacy_unrestricted: false,
-          allowed_services: [
-            { id: "svc-aevatar", slug: "aevatar", deleted: false },
-            { id: "svc-llm", slug: "chrono-llm-public", deleted: false },
-            { id: "svc-ornn", slug: "ornn-api", deleted: false },
-            { id: "svc-openai", slug: "openai-test", deleted: false },
-          ],
-        }],
+    if (req.method === "POST" && url.pathname === "/api/v1/auth/logout") {
+      if (!authenticated) {
+        json(res, 401, { message: "not authenticated" });
+        return;
+      }
+      state.logoutRequests += 1;
+      json(res, 200, { ok: true }, {
+        "Set-Cookie": "nyx_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
       });
       return;
     }
     if (req.method === "GET" && url.pathname === "/api/v1/user-services") {
+      state.authHeaders.push({
+        path: url.pathname,
+        authorization: req.headers.authorization || "",
+        cookie: req.headers.cookie || "",
+      });
+      if (!authenticated) {
+        json(res, 401, { message: "not authenticated" });
+        return;
+      }
       json(res, 200, { services });
       return;
     }
-    if (req.method === "POST" && url.pathname === "/oauth/revoke") {
-      state.revocations += 1;
-      json(res, 200, {});
+    if (req.method === "GET" &&
+        url.pathname === "/api/v1/proxy/s/aevatar/api/capabilities") {
+      json(res, 200, { ok: true });
+      return;
+    }
+    if (req.method === "GET" &&
+        url.pathname === "/api/v1/proxy/s/ornn-api/api/v1/skill-search") {
+      json(res, 200, { items: [] });
+      return;
+    }
+    if (req.method === "POST" &&
+        url.pathname === "/api/v1/proxy/s/aevatar/api/scopes/user-1/nyxid-chat/conversations") {
+      json(res, 200, { actorId: "actor-1" });
+      return;
+    }
+    if (req.method === "GET" &&
+        url.pathname === "/api/v1/proxy/s/aevatar/api/scopes/user-1/nyxid-chat/conversations") {
+      json(res, 200, { conversations: [{ actorId: "actor-1" }] });
+      return;
+    }
+    if (req.method === "POST" &&
+        url.pathname === "/api/v1/proxy/s/aevatar/api/scopes/user-1/nyxid-chat/conversations/actor-1:stream") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-store",
+        "X-Correlation-Id": "corr-test-stream",
+      });
+      const timers = [];
+      const writeKeepalive = () => sse(res, {
+        type: "CUSTOM",
+        custom: { name: "aevatar.nyxid_chat.keepalive", payload: {} },
+      });
+      writeKeepalive();
+      const keepaliveTimer = setInterval(writeKeepalive, 20);
+      const cleanup = () => {
+        clearInterval(keepaliveTimer);
+        timers.forEach(clearTimeout);
+      };
+      res.once("close", () => {
+        cleanup();
+        if (!res.writableEnded) state.streamAborts += 1;
+      });
+
+      if (state.streamScenario === "progress-then-finish") {
+        timers.push(setTimeout(() => sse(res, {
+          type: "RUN_STARTED",
+          runStarted: { runId: "run-1" },
+        }), 120));
+        timers.push(setTimeout(() => {
+          sse(res, { type: "RUN_FINISHED", runFinished: {} });
+          res.end();
+        }, 240));
+      }
       return;
     }
     json(res, 404, { message: "not found" });
@@ -195,12 +221,20 @@ async function startMockNyxId(t) {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", resolve);
   });
-  t.after(() => server.close());
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
   return { baseUrl, resources, state };
 }
 
-test("OAuth BFF protects runtime APIs and builds a least-privilege login request", async (t) => {
-  const { baseUrl, port } = await startServer(t);
+test("site-session BFF protects APIs and returns localhost login through first-party handoff", async (t) => {
+  const nyxid = await startMockNyxId(t);
+  const { baseUrl, port } = await startServer(t, {
+    NYXID_BASE_URL: nyxid.baseUrl,
+    NYXID_WEB_URL: nyxid.baseUrl,
+    NYXID_AEVATAR_PROXY_URL: nyxid.resources.aevatar,
+  });
 
   const session = await fetch(`${baseUrl}/api/auth/session`);
   assert.equal(session.status, 200);
@@ -224,59 +258,94 @@ test("OAuth BFF protects runtime APIs and builds a least-privilege login request
 
   const login = await fetch(`${baseUrl}/api/auth/login`, { redirect: "manual" });
   assert.equal(login.status, 302);
-  assert.match(login.headers.get("set-cookie"), /HttpOnly; SameSite=Lax/);
-  const authorize = new URL(login.headers.get("location"));
-  assert.equal(authorize.origin, "https://nyx-api.chrono-ai.fun");
-  assert.equal(authorize.pathname, "/oauth/authorize");
-  assert.equal(authorize.searchParams.get("response_type"), "code");
-  assert.equal(authorize.searchParams.get("code_challenge_method"), "S256");
-  assert.ok(authorize.searchParams.get("code_challenge"));
-  assert.ok(authorize.searchParams.get("nonce"));
-  assert.ok(authorize.searchParams.get("state"));
-  assert.equal(
-    authorize.searchParams.get("redirect_uri"),
-    `http://127.0.0.1:${port}/auth/callback`,
+  const handoff = new URL(login.headers.get("location"));
+  assert.equal(handoff.origin, nyxid.baseUrl);
+  assert.equal(handoff.pathname, "/cli-auth");
+  assert.equal(handoff.searchParams.get("port"), String(port));
+  assert.equal(handoff.searchParams.get("client_ua"), "nyxid-assistant");
+  assert.ok(handoff.searchParams.get("state"));
+
+  const callback = await fetch(`${baseUrl}/callback?${new URLSearchParams({
+    access_token: "test-access-token",
+    refresh_token: "test-refresh-token",
+    state: handoff.searchParams.get("state"),
+  })}`, { redirect: "manual" });
+  assert.equal(callback.status, 303);
+  assert.equal(callback.headers.get("location"), "/");
+  const localSessionCookie = callback.headers.get("set-cookie").split(";", 1)[0];
+  assert.match(localSessionCookie, /^nyxid_chat_token_session=/);
+
+  const authenticated = await fetch(`${baseUrl}/api/auth/session`, {
+    headers: { Cookie: `${localSessionCookie}; nyx_session=stale-local-cookie; theme=dark` },
+  });
+  assert.equal(authenticated.status, 200);
+  assert.equal((await authenticated.json()).user.id, "user-1");
+  assert.ok(nyxid.state.authHeaders.some(
+    (entry) => entry.authorization === "Bearer test-access-token" && entry.cookie === "",
+  ));
+
+  const localLogout = await fetch(`${baseUrl}/api/auth/logout`, {
+    method: "POST",
+    headers: { Cookie: localSessionCookie, Origin: baseUrl },
+  });
+  assert.equal(localLogout.status, 200);
+  assert.match(localLogout.headers.get("set-cookie"), /nyxid_chat_token_session=;/);
+
+  const sameOriginReturnTo = "/assistant?c=conversation-1#latest";
+  const sameOriginLogin = await fetch(
+    `${baseUrl}/api/auth/login?${new URLSearchParams({ return_to: sameOriginReturnTo })}`,
+    {
+      headers: {
+        "X-Forwarded-Host": new URL(nyxid.baseUrl).host,
+        "X-Forwarded-Proto": "http",
+      },
+      redirect: "manual",
+    },
   );
-  assert.equal(authorize.searchParams.get("scope"), "openid profile email proxy");
-  assert.deepEqual(authorize.searchParams.getAll("resource"), [
-    "https://nyx-api.chrono-ai.fun/api/v1/proxy/s/aevatar",
-    "https://nyx-api.chrono-ai.fun/api/v1/proxy/s/chrono-llm-public",
-    "https://nyx-api.chrono-ai.fun/api/v1/proxy/s/ornn-api",
-  ]);
+  const siteLogin = new URL(sameOriginLogin.headers.get("location"));
+  assert.equal(siteLogin.pathname, "/login");
+  assert.equal(
+    siteLogin.searchParams.get("return_to"),
+    `${nyxid.baseUrl}${sameOriginReturnTo}`,
+  );
+
+  const externalReturnLogin = await fetch(
+    `${baseUrl}/api/auth/login?${new URLSearchParams({
+      return_to: "https://attacker.example/collect",
+    })}`,
+    {
+      headers: {
+        "X-Forwarded-Host": new URL(nyxid.baseUrl).host,
+        "X-Forwarded-Proto": "http",
+      },
+      redirect: "manual",
+    },
+  );
+  const externalReturnTarget = new URL(externalReturnLogin.headers.get("location"));
+  assert.equal(externalReturnTarget.searchParams.get("return_to"), `${nyxid.baseUrl}/`);
+
+  const incremental = await fetch(`${baseUrl}/api/auth/authorize?serviceId=svc-openai`);
+  assert.equal(incremental.status, 410);
+  assert.equal((await incremental.json()).code, "DEVELOPER_APP_AUTH_REMOVED");
 });
 
-test("OAuth callback creates a server-side session and preserves existing consent on incremental auth", async (t) => {
+test("BFF validates and forwards the NyxID site session", async (t) => {
   const nyxid = await startMockNyxId(t);
   const { baseUrl } = await startServer(t, {
     NYXID_BASE_URL: nyxid.baseUrl,
+    NYXID_WEB_URL: nyxid.baseUrl,
     NYXID_AEVATAR_PROXY_URL: nyxid.resources.aevatar,
-    NYXID_OAUTH_CLIENT_ID: "test-client",
   });
-
-  const login = await fetch(`${baseUrl}/api/auth/login`, { redirect: "manual" });
-  const authorize = new URL(login.headers.get("location"));
-  nyxid.state.nonce = authorize.searchParams.get("nonce");
-  const state = authorize.searchParams.get("state");
-  const stateCookie = login.headers.get("set-cookie").split(";", 1)[0];
-
-  const callback = await fetch(`${baseUrl}/auth/callback?state=${encodeURIComponent(state)}&code=test-code`, {
-    headers: { Cookie: stateCookie },
-    redirect: "manual",
-  });
-  assert.equal(callback.status, 200);
-  const sessionCookieMatch = callback.headers.get("set-cookie")
-    .match(/nyxid_chat_session=([^;,]+)/);
-  assert.ok(sessionCookieMatch, "callback should set an HttpOnly session cookie");
-  const sessionCookie = `nyxid_chat_session=${sessionCookieMatch[1]}`;
+  const browserCookies = "theme=dark; nyx_session=test-session; analytics_id=private";
+  const sessionCookie = "nyx_session=test-session";
 
   const sessionResponse = await fetch(`${baseUrl}/api/auth/session`, {
-    headers: { Cookie: sessionCookie },
+    headers: { Cookie: browserCookies },
   });
   const sessionPayload = await sessionResponse.json();
-  assert.ok(Date.parse(sessionPayload.expiresAt) > Date.now());
-  delete sessionPayload.expiresAt;
   assert.deepEqual(sessionPayload, {
     authenticated: true,
+    authMode: "site-session",
     user: {
       id: "user-1",
       name: "Test User",
@@ -284,11 +353,11 @@ test("OAuth callback creates a server-side session and preserves existing consen
       picture: "",
     },
     scopeId: "user-1",
-    resources: [nyxid.resources.aevatar, nyxid.resources.llm, nyxid.resources.ornn],
+    resources: [],
   });
 
   const servicesResponse = await fetch(`${baseUrl}/api/auth/services`, {
-    headers: { Cookie: sessionCookie },
+    headers: { Cookie: browserCookies },
   });
   assert.equal(servicesResponse.status, 200);
   const services = (await servicesResponse.json()).services;
@@ -298,35 +367,94 @@ test("OAuth callback creates a server-side session and preserves existing consen
   assert.equal(services.find((service) => service.id === "svc-llm").core, true);
   assert.equal(services.find((service) => service.id === "svc-ornn").authorized, true);
   assert.equal(services.find((service) => service.id === "svc-ornn").core, true);
-  assert.equal(services.find((service) => service.id === "svc-openai").authorized, false);
+  assert.equal(services.find((service) => service.id === "svc-openai").authorized, true);
   assert.equal(services.find((service) => service.id === "svc-openai").core, false);
-
-  const incremental = await fetch(`${baseUrl}/api/auth/authorize?serviceId=svc-openai`, {
-    headers: { Cookie: sessionCookie },
-    redirect: "manual",
-  });
-  assert.equal(incremental.status, 302);
-  const incrementalAuthorize = new URL(incremental.headers.get("location"));
-  assert.equal(incrementalAuthorize.searchParams.get("prompt"), "consent");
-  assert.deepEqual(new Set(incrementalAuthorize.searchParams.getAll("resource")), new Set([
-    nyxid.resources.aevatar,
-    nyxid.resources.llm,
-    nyxid.resources.ornn,
-    nyxid.resources.openai,
-  ]));
 
   const logout = await fetch(`${baseUrl}/api/auth/logout`, {
     method: "POST",
-    headers: { Cookie: sessionCookie, Origin: baseUrl },
+    headers: { Cookie: browserCookies, Origin: baseUrl },
   });
   assert.equal(logout.status, 200);
-  assert.equal(nyxid.state.revocations, 1);
+  assert.equal(nyxid.state.logoutRequests, 1);
+  assert.match(logout.headers.get("set-cookie"), /nyx_session=;/);
+  assert.ok(nyxid.state.authHeaders.length >= 3);
+  assert.deepEqual(new Set(nyxid.state.authHeaders.map((entry) => entry.cookie)), new Set([sessionCookie]));
+  assert.ok(nyxid.state.authHeaders.every((entry) => entry.authorization === ""));
 });
 
-test("OAuth callback fails closed when state is missing", async (t) => {
-  const { baseUrl } = await startServer(t);
-  const response = await fetch(`${baseUrl}/auth/callback?state=invalid&code=invalid`);
-  assert.equal(response.status, 400);
-  assert.match(response.headers.get("content-security-policy"), /default-src 'none'/);
-  assert.match(await response.text(), /授权未完成/);
+test("explicit bearer credentials take precedence over ambient cookies", async (t) => {
+  const nyxid = await startMockNyxId(t);
+  const { baseUrl } = await startServer(t, {
+    NYXID_BASE_URL: nyxid.baseUrl,
+    NYXID_WEB_URL: nyxid.baseUrl,
+    NYXID_AEVATAR_PROXY_URL: nyxid.resources.aevatar,
+  });
+  const headers = {
+    Authorization: "Bearer test-access-token",
+    Cookie: "nyx_session=wrong-session; theme=dark",
+  };
+
+  const session = await fetch(`${baseUrl}/api/auth/session`, { headers });
+  assert.equal(session.status, 200);
+  assert.equal((await session.json()).user.id, "user-1");
+
+  const services = await fetch(`${baseUrl}/api/auth/services`, { headers });
+  assert.equal(services.status, 200);
+
+  const health = await fetch(`${baseUrl}/api/demo/health`, {
+    method: "POST",
+    headers: { ...headers, Origin: baseUrl, "Content-Type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(health.status, 200);
+  assert.equal((await health.json()).ok, true);
+
+  assert.ok(nyxid.state.authHeaders.every((entry) => entry.cookie === ""));
+  assert.ok(nyxid.state.authHeaders.every(
+    (entry) => entry.authorization === "Bearer test-access-token",
+  ));
+  assert.deepEqual(new Set(nyxid.state.proxyCookies), new Set([""]));
+  assert.deepEqual(
+    new Set(nyxid.state.proxyAuthorizations),
+    new Set(["Bearer test-access-token"]),
+  );
+});
+
+test("SSE proxy times out keepalive-only runs and preserves real progress", async (t) => {
+  const nyxid = await startMockNyxId(t);
+  const { baseUrl } = await startServer(t, {
+    NYXID_BASE_URL: nyxid.baseUrl,
+    NYXID_WEB_URL: nyxid.baseUrl,
+    NYXID_AEVATAR_PROXY_URL: nyxid.resources.aevatar,
+    DEMO_STREAM_PROGRESS_TIMEOUT_MS: "200",
+  });
+  const sessionCookie = "nyx_session=test-session";
+  const request = () => fetch(`${baseUrl}/api/demo/chat`, {
+    method: "POST",
+    headers: {
+      Cookie: sessionCookie,
+      Origin: baseUrl,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ prompt: "find skills", surface: "nyxid-chat" }),
+  });
+
+  const stalledResponse = await request();
+  assert.equal(stalledResponse.status, 200);
+  assert.equal(stalledResponse.headers.get("x-correlation-id"), "corr-test-stream");
+  const stalledBody = await stalledResponse.text();
+  assert.match(stalledBody, /aevatar\.nyxid_chat\.keepalive/);
+  assert.match(stalledBody, /UPSTREAM_PROGRESS_TIMEOUT/);
+  assert.match(stalledBody, /corr-test-stream/);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(nyxid.state.streamAborts, 1, "timed-out upstream stream should be cancelled");
+
+  nyxid.state.streamScenario = "progress-then-finish";
+  const progressingResponse = await request();
+  assert.equal(progressingResponse.status, 200);
+  const progressingBody = await progressingResponse.text();
+  assert.match(progressingBody, /RUN_STARTED/);
+  assert.match(progressingBody, /RUN_FINISHED/);
+  assert.doesNotMatch(progressingBody, /UPSTREAM_PROGRESS_TIMEOUT/);
+  assert.deepEqual(new Set(nyxid.state.proxyCookies), new Set([sessionCookie]));
 });
