@@ -54,6 +54,12 @@ function sse(res, frame) {
   res.write(`data: ${JSON.stringify(frame)}\n\n`);
 }
 
+async function readJsonBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+}
+
 async function startMockNyxId(t) {
   const port = await freePort();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -62,8 +68,11 @@ async function startMockNyxId(t) {
     logoutRequests: 0,
     proxyAuthorizations: [],
     proxyCookies: [],
+    proxyRequests: [],
+    historyErrorMessage: "",
     streamAborts: 0,
     streamScenario: "keepalive-only",
+    workflowChatBodies: [],
   };
   const resources = {
     aevatar: `${baseUrl}/api/v1/proxy/s/aevatar`,
@@ -106,13 +115,19 @@ async function startMockNyxId(t) {
     },
   ];
 
-  const server = createHttpServer((req, res) => {
+  const server = createHttpServer(async (req, res) => {
     const url = new URL(req.url || "/", baseUrl);
     const authenticated = req.headers.cookie === "nyx_session=test-session" ||
       req.headers.authorization === "Bearer test-access-token";
     if (url.pathname.startsWith("/api/v1/proxy/")) {
       state.proxyCookies.push(req.headers.cookie || "");
       state.proxyAuthorizations.push(req.headers.authorization || "");
+      state.proxyRequests.push({
+        method: req.method,
+        path: url.pathname,
+        identityToken: req.headers["x-nyxid-identity-token"] || "",
+        delegationToken: req.headers["x-nyxid-delegation-token"] || "",
+      });
       if (!authenticated) {
         json(res, 401, { message: "not authenticated" });
         return;
@@ -168,6 +183,26 @@ async function startMockNyxId(t) {
     if (req.method === "GET" &&
         url.pathname === "/api/v1/proxy/s/ornn-api/api/v1/skill-search") {
       json(res, 200, { items: [] });
+      return;
+    }
+    if (req.method === "GET" &&
+        url.pathname === "/api/v1/proxy/s/aevatar/api/scopes/user-1/chat-history") {
+      if (state.historyErrorMessage) {
+        json(res, 401, { message: state.historyErrorMessage });
+        return;
+      }
+      json(res, 200, { conversations: [] });
+      return;
+    }
+    if (req.method === "POST" &&
+        url.pathname === "/api/v1/proxy/s/aevatar/api/chat") {
+      state.workflowChatBodies.push(await readJsonBody(req));
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-store",
+      });
+      sse(res, { type: "RUN_FINISHED", runFinished: {} });
+      res.end();
       return;
     }
     if (req.method === "POST" &&
@@ -418,6 +453,70 @@ test("explicit bearer credentials take precedence over ambient cookies", async (
     new Set(nyxid.state.proxyAuthorizations),
     new Set(["Bearer test-access-token"]),
   );
+});
+
+test("BFF leaves identity assertions to the proxy and ignores client scope authority", async (t) => {
+  const nyxid = await startMockNyxId(t);
+  const { baseUrl } = await startServer(t, {
+    NYXID_BASE_URL: nyxid.baseUrl,
+    NYXID_WEB_URL: nyxid.baseUrl,
+    NYXID_AEVATAR_PROXY_URL: nyxid.resources.aevatar,
+  });
+  const credentialHeaders = {
+    Cookie: "nyx_session=test-session",
+    "X-NyxID-Identity-Token": "client-forged-identity",
+    "X-NyxID-Delegation-Token": "client-forged-delegation",
+  };
+
+  const chat = await fetch(`${baseUrl}/api/demo/chat`, {
+    method: "POST",
+    headers: {
+      ...credentialHeaders,
+      Origin: baseUrl,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      surface: "workflow",
+      workflow: "direct",
+      prompt: "use my own scope",
+      sessionId: "session-1",
+      scopeId: "user-2",
+    }),
+  });
+  assert.equal(chat.status, 200);
+  assert.match(await chat.text(), /RUN_FINISHED/);
+
+  const history = await fetch(`${baseUrl}/api/demo/conversations?scopeId=user-2`, {
+    headers: credentialHeaders,
+  });
+  assert.equal(history.status, 200);
+  assert.deepEqual(await history.json(), { conversations: [] });
+
+  assert.deepEqual(nyxid.state.workflowChatBodies, [{
+    prompt: "use my own scope",
+    workflow: "direct",
+    sessionId: "session-1",
+  }]);
+  assert.ok(nyxid.state.proxyRequests.some(
+    (request) => request.path.endsWith("/api/chat"),
+  ));
+  assert.ok(nyxid.state.proxyRequests.some(
+    (request) => request.path.endsWith("/api/scopes/user-1/chat-history"),
+  ));
+  assert.ok(nyxid.state.proxyRequests.every(
+    (request) => !request.path.includes("user-2") &&
+      request.identityToken === "" && request.delegationToken === "",
+  ));
+
+  const assertionJwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyLTEifQ.signature";
+  nyxid.state.historyErrorMessage = `invalid assertion ${assertionJwt}`;
+  const failedHistory = await fetch(`${baseUrl}/api/demo/conversations`, {
+    headers: { Cookie: "nyx_session=test-session" },
+  });
+  assert.equal(failedHistory.status, 401);
+  const failure = await failedHistory.text();
+  assert.match(failure, /\[redacted-jwt\]/);
+  assert.doesNotMatch(failure, /eyJhbGci/);
 });
 
 test("SSE proxy times out keepalive-only runs and preserves real progress", async (t) => {

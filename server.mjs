@@ -193,6 +193,7 @@ async function requestCredential(req) {
 }
 
 function credentialHeaders(credential, accept = "application/json") {
+  // Identity and delegation headers belong to the NyxID proxy and are never accepted from clients.
   const headers = { Accept: accept };
   if (credential?.authorization) headers.Authorization = credential.authorization;
   if (credential?.cookie) headers.Cookie = credential.cookie;
@@ -346,6 +347,7 @@ function writeSse(res, frame) {
 function redactMessage(value) {
   return String(value || "Unknown error")
     .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [redacted]")
+    .replace(/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[redacted-jwt]")
     .replace(/nyx(?:id)?_[A-Za-z0-9_-]{8,}/gi, "nyx_[redacted]")
     .slice(0, 1200);
 }
@@ -830,7 +832,6 @@ async function handleChat(req, res, body) {
       prompt,
       workflow: runtime.workflow,
       sessionId,
-      ...(runtime.scopeId ? { scopeId: runtime.scopeId } : {}),
       ...(inputParts.length ? { inputParts } : {}),
     };
     await forwardStream(req, res, runtime, "/api/chat", {

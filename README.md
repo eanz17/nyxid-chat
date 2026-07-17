@@ -6,9 +6,10 @@ session、broker `binding_id` 或执行 token exchange。
 
 NyxID 当前网页端并不会把 access token 暴露给 JavaScript。浏览器使用的是 HttpOnly
 `nyx_session` cookie；同源部署时浏览器会自动把它带给 Chat BFF。BFF 调用
-`/api/v1/users/me` 校验用户，再把同一登录凭据转发给 NyxID proxy。宿主若使用 token-based
-认证，也可以显式传入 `Authorization: Bearer ...`，但标准 website 集成不需要读取或存储
-access token。
+`/api/v1/users/me` 校验用户，再把同一登录凭据转发给 NyxID proxy。proxy 校验凭据后，为每次
+Aevatar 请求注入短期 `X-NyxID-Identity-Token` 和 `X-NyxID-Delegation-Token`；BFF 和浏览器
+都不读取、签发或转发这两个代理专用 token。宿主若使用 token-based 认证，也可以显式传入
+`Authorization: Bearer ...`，但标准 website 集成不需要读取或存储 access token。
 
 localhost 联调是一个受限的例外：由于线上 HttpOnly cookie 不可能发送给 localhost，登录入口
 会使用 NyxID 已有的 `/cli-auth` first-party handoff。它基于用户现有站点 session 签发普通用户
@@ -22,7 +23,9 @@ NyxID website (already signed in)
   -> Chat BFF + nyx_session
      -> NyxID /api/v1/users/me
      -> NyxID proxy /aevatar + the same site session
-        -> NyxIdChatGAgent
+        -> X-NyxID-Identity-Token (caller identity, aud urn:aevatar:api)
+        -> X-NyxID-Delegation-Token (downstream NyxID access)
+        -> Aevatar / NyxIdChatGAgent
            -> the user's configured NyxID services
 ```
 
@@ -83,6 +86,20 @@ NYXID_OAUTH_SCOPES
 完整配置见 `.env.example`。`server.mjs` 不自行加载 `.env`；`boot.sh` 会加载它并传给后台
 进程，其他启动方式需由 shell、容器或进程管理器注入。
 
+NyxID 中 `aevatar` service 的身份传播配置必须是：
+
+```json
+{
+  "identity_propagation_mode": "jwt",
+  "identity_jwt_audience": "urn:aevatar:api",
+  "inject_delegation_token": true,
+  "forward_access_token": false
+}
+```
+
+这是 NyxID service catalog 配置，不是本仓库的环境变量。`inject_delegation_token` 不能关闭，
+因为 Aevatar 在确认调用者身份后仍需要代表用户调用 NyxID API、LLM route 和 tools。
+
 ## 运行
 
 要求 Node.js 20+：
@@ -135,8 +152,13 @@ developer-app consent 的旧前端；OAuth callback 已删除。
   token 不写入浏览器 storage。
 - 同源登录由页面显式携带当前站内回跳路径，BFF 只接受 NyxID website 同源目标。
 - 显式 bearer 优先于 ambient cookie，方便由可信宿主注入 token；响应和日志不回显凭据。
+- 浏览器提交的 `X-NyxID-Identity-Token` 和 `X-NyxID-Delegation-Token` 不会被 BFF 转发；
+  只有 NyxID proxy 可以在发往 Aevatar 的请求上注入它们。
 - 所有非安全方法继续执行同源校验，支持反向代理的 `X-Forwarded-Host`。
-- 用户 ID 只取自 `/api/v1/users/me`，忽略浏览器提交的 scope 或 user ID。
+- 用户 ID 只取自 `/api/v1/users/me`，忽略浏览器提交的 scope 或 user ID；`POST /api/chat`
+  不发送 body `scopeId`，由 Aevatar 只按已验证 identity token 的 `sub` 派生 scope。
+- 仍包含 `scopeId` 的 Aevatar 路径只使用服务端验证出的用户 ID；Aevatar 会再次校验它与
+  identity token 的 `sub` 一致，不一致时返回 HTTP 403。
 - logout 的 `Set-Cookie` 会从 NyxID API 原样返回浏览器。
 - SSE/raw event 继续执行凭据和 reasoning 脱敏。
 - Aevatar approval 卡片不是最终安全边界，proxy policy 必须独立执行。
@@ -150,8 +172,9 @@ node --check public/app.js
 node --check public/protocol.js
 ```
 
-测试覆盖站点 cookie/bearer 转发、cookie allowlist、同源保护、登录与退出、service 配置后显式
-重试、多会话并行、SSE normalization、usage 合并、历史 normalization 和凭据脱敏。
+测试覆盖站点 cookie/bearer 转发、cookie 与代理专用 header allowlist、scope override 防护、
+同源保护、登录与退出、service 配置后显式重试、多会话并行、SSE normalization、usage 合并、
+历史 normalization 和凭据脱敏。
 
 ## 文件结构
 
