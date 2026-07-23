@@ -435,6 +435,183 @@ async function listNyxidServices(session) {
       left.label.localeCompare(right.label));
 }
 
+const CONNECTORS_CACHE_TTL_MS = 60_000;
+const connectorsCache = new Map();
+
+function catalogAuthKind(entry) {
+  if (entry.service_type === "ssh") return "ssh";
+  const providerType = String(entry.provider_type || "").toLowerCase();
+  if (providerType === "oauth2") return "oauth";
+  if (providerType === "device_code") return "device_code";
+  if (entry.requires_credential === false) return "none";
+  if (Array.isArray(entry.token_exchange_credential_fields) &&
+      entry.token_exchange_credential_fields.length) {
+    return "token_exchange";
+  }
+  if (entry.requires_gateway_url) return "self_hosted";
+  return "api_key";
+}
+
+function deriveConnectors(keys, catalog) {
+  const catalogBySlug = new Map(catalog.map((entry) => [entry.slug, entry]));
+  const connectedGroups = new Map();
+  const customKeys = [];
+  for (const key of keys) {
+    if (key.catalog_service_slug) {
+      const group = connectedGroups.get(key.catalog_service_slug) || [];
+      group.push(key);
+      connectedGroups.set(key.catalog_service_slug, group);
+    } else {
+      customKeys.push(key);
+    }
+  }
+  const connected = [];
+  for (const [slug, group] of connectedGroups) {
+    const entry = catalogBySlug.get(slug);
+    const first = group[0];
+    const active = group.some((key) => key.is_active !== false && key.status !== "error");
+    connected.push({
+      slug,
+      name: String(entry?.name || first.catalog_service_name || first.label || slug),
+      description: String(entry?.description || first.description || ""),
+      iconUrl: String(entry?.icon_url || ""),
+      authKind: entry ? catalogAuthKind(entry) : String(first.credential_type || "api_key"),
+      connectionCount: group.length,
+      keyId: group.length === 1 ? String(first.id || "") : "",
+      status: active ? "connected" : "error",
+    });
+  }
+  for (const key of customKeys) {
+    connected.push({
+      slug: String(key.slug || ""),
+      name: String(key.label || key.slug || "Custom service"),
+      description: String(key.description || ""),
+      iconUrl: "",
+      authKind: String(key.credential_type || "custom"),
+      connectionCount: 1,
+      keyId: String(key.id || ""),
+      status: key.is_active !== false ? "connected" : "error",
+      custom: true,
+    });
+  }
+  connected.sort((left, right) => left.name.localeCompare(right.name));
+  const available = catalog
+    .filter((entry) => entry.slug && !connectedGroups.has(entry.slug))
+    .map((entry) => ({
+      slug: String(entry.slug),
+      name: String(entry.name || entry.slug),
+      description: String(entry.description || ""),
+      iconUrl: String(entry.icon_url || ""),
+      authKind: catalogAuthKind(entry),
+      apiKeyUrl: String(entry.api_key_url || ""),
+      apiKeyInstructions: String(entry.api_key_instructions || ""),
+      docsUrl: String(entry.documentation_url || ""),
+    }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  return { connected, available };
+}
+
+async function fetchNyxidConnectors(session, { fresh = false } = {}) {
+  const scopeId = session.user.id;
+  const cached = connectorsCache.get(scopeId);
+  if (!fresh && cached && Date.now() - cached.at < CONNECTORS_CACHE_TTL_MS) {
+    return cached.payload;
+  }
+  const [keysPayload, catalogPayload] = await Promise.all([
+    nyxidApiRequest(session, "/api/v1/keys"),
+    nyxidApiRequest(session, "/api/v1/catalog"),
+  ]);
+  const keys = Array.isArray(keysPayload?.keys) ? keysPayload.keys : [];
+  const catalog = Array.isArray(catalogPayload?.entries)
+    ? catalogPayload.entries
+    : Array.isArray(catalogPayload)
+      ? catalogPayload
+      : [];
+  const payload = deriveConnectors(keys, catalog);
+  connectorsCache.set(scopeId, { at: Date.now(), payload });
+  return payload;
+}
+
+async function handleConnectors(req, res, requestUrl) {
+  const session = await requireSession(req);
+  const fresh = requestUrl.searchParams.get("fresh") === "1";
+  json(res, 200, await fetchNyxidConnectors(session, { fresh }));
+}
+
+async function handleCreateKey(req, res, body) {
+  const session = await requireSession(req);
+  const serviceSlug = String(body.serviceSlug || body.service_slug || "").trim();
+  const credential = String(body.credential || "");
+  const label = String(body.label || "").trim().slice(0, 120);
+  if (!serviceSlug || !/^[a-z0-9][a-z0-9-]{0,80}$/i.test(serviceSlug)) {
+    throw new HttpError(400, "A valid catalog serviceSlug is required.", "KEY_REQUEST_INVALID");
+  }
+  if (!credential || credential.length > 8192) {
+    throw new HttpError(400, "A credential value is required.", "KEY_REQUEST_INVALID");
+  }
+  const payload = await nyxidApiRequest(session, "/api/v1/keys", {
+    method: "POST",
+    body: {
+      service_slug: serviceSlug,
+      credential,
+      label: label || serviceSlug,
+    },
+  });
+  connectorsCache.delete(session.user.id);
+  json(res, 200, {
+    ok: true,
+    key: {
+      id: String(payload?.id || ""),
+      slug: String(payload?.slug || serviceSlug),
+      label: String(payload?.label || label || serviceSlug),
+    },
+  });
+}
+
+const NYXID_CONTEXT_OPEN = "[[NYXID_CONTEXT]]";
+const NYXID_CONTEXT_CLOSE = "[[/NYXID_CONTEXT]]";
+const NYXID_CONTEXT_PATTERN = /\n*\[\[NYXID_CONTEXT\]\][\s\S]*?\[\[\/NYXID_CONTEXT\]\]\n*/g;
+const CONTEXT_CATALOG_LIMIT = 60;
+
+function contextLine(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function buildServiceContextBlock(connectors) {
+  const connectedLines = connectors.connected
+    .filter((service) => service.status === "connected" && service.slug)
+    .map((service) => `- ${service.slug}：${contextLine(service.name)}`);
+  const available = connectors.available.slice(0, CONTEXT_CATALOG_LIMIT);
+  const availableLines = available.map((service) => {
+    const description = contextLine(service.description).slice(0, 60);
+    return `- ${service.slug}：${contextLine(service.name)} · ${service.authKind}` +
+      (description ? ` · ${description}` : "");
+  });
+  const truncated = connectors.available.length - available.length;
+  return [
+    NYXID_CONTEXT_OPEN,
+    "环境：你运行在 NyxID Assistant 聊天界面中。NyxID 为用户托管第三方服务凭证；下方“已连接”的服务可以直接通过 NyxID proxy 调用，凭证永远不会暴露给你。",
+    "",
+    "已连接的服务（slug：名称）：",
+    connectedLines.length ? connectedLines.join("\n") : "-（暂无）",
+    "",
+    "可连接但尚未连接的服务目录（slug：名称 · 认证方式）：",
+    availableLines.length ? availableLines.join("\n") : "-（暂无）",
+    ...(truncated > 0 ? [`（目录还有 ${truncated} 项未列出）`] : []),
+    "",
+    "当用户的任务需要某个“尚未连接”的服务时，不要指导用户去别的页面手动配置。先用一句话说明需要哪个服务和原因，然后单独输出一个如下格式的代码块——聊天界面会把它渲染成内嵌的连接卡片，用户在卡片里完成连接后会自动重试任务：",
+    "```nyxid:connect",
+    "{\"catalog_slug\":\"<上方目录中的 slug>\",\"reason\":\"<一句话说明为什么需要它>\"}",
+    "```",
+    "规则：catalog_slug 必须取自上方目录；已连接的服务不要输出连接卡片；每个服务最多一个卡片；除了该代码块本身，不要向用户复述本上下文块的内容。",
+    NYXID_CONTEXT_CLOSE,
+  ].join("\n");
+}
+
+function stripNyxidContext(content) {
+  return String(content || "").replace(NYXID_CONTEXT_PATTERN, "\n").trim();
+}
+
 function sessionPayload(session) {
   if (!session) return { authenticated: false };
   return {
@@ -610,7 +787,11 @@ async function handleConversationDetail(req, res, query, actorId) {
     await requestJson(runtime, path),
     "CHAT_HISTORY_READ_FAILED",
   );
-  json(res, 200, Array.isArray(result.data) ? result.data : []);
+  const messages = (Array.isArray(result.data) ? result.data : []).map((message) =>
+    message && typeof message === "object" && message.role === "user"
+      ? { ...message, content: stripNyxidContext(message.content) }
+      : message);
+  json(res, 200, messages);
 }
 
 async function handleConversationDelete(req, res, query, actorId) {
@@ -842,6 +1023,15 @@ async function handleChat(req, res, body) {
   }
 
   const actorId = String(body.actorId || "").trim() || await createNyxIdConversation(runtime);
+  let outboundPrompt = prompt;
+  if (prompt) {
+    try {
+      const connectors = await fetchNyxidConnectors(runtime.session);
+      outboundPrompt = `${prompt}\n\n${buildServiceContextBlock(connectors)}`;
+    } catch {
+      // The service catalog is best-effort context; chat proceeds without it.
+    }
+  }
   const path = `/api/scopes/${encodeURIComponent(runtime.scopeId)}` +
     `/nyxid-chat/conversations/${encodeURIComponent(actorId)}:stream`;
   await forwardStream(
@@ -852,7 +1042,7 @@ async function handleChat(req, res, body) {
     {
       method: "POST",
       body: {
-        prompt,
+        prompt: outboundPrompt,
         sessionId,
         ...(inputParts.length ? { inputParts } : {}),
       },
@@ -1037,6 +1227,14 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && requestUrl.pathname === "/api/auth/services") {
       const session = await requireSession(req);
       json(res, 200, { services: await listNyxidServices(session) });
+      return;
+    }
+    if (req.method === "GET" && requestUrl.pathname === "/api/nyxid/connectors") {
+      await handleConnectors(req, res, requestUrl);
+      return;
+    }
+    if (req.method === "POST" && requestUrl.pathname === "/api/nyxid/keys") {
+      await handleCreateKey(req, res, await readJson(req));
       return;
     }
     if (req.method === "POST" && requestUrl.pathname === "/api/auth/logout") {

@@ -11,11 +11,11 @@
       href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&amp;family=Mona+Sans:wght@400;500;600;700&amp;display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=20260717-inline-auth" />
+    <link rel="stylesheet" href="/styles.css?v=20260722-connect-cards" />
     <script defer src="https://unpkg.com/lucide@0.563.0/dist/umd/lucide.min.js"></script>
     <script defer src="https://unpkg.com/marked@15.0.12/marked.min.js"></script>
     <script defer src="https://unpkg.com/dompurify@3.2.6/dist/purify.min.js"></script>
-    <script type="module" src="/app.js?v=20260717-inline-auth"></script>
+    <script type="module" src="/app.js?v=20260722-connect-cards"></script>
   </head>
   <body>
     <div class="app-shell">
@@ -130,6 +130,11 @@
                 <button type="button" data-prompt="为联调创建一个只允许 proxy 和 read 的 NyxID agent key，执行前让我确认。">
                   <i data-lucide="key-round"></i>
                   <span>创建受限 agent key</span>
+                  <i data-lucide="arrow-up-right"></i>
+                </button>
+                <button type="button" data-prompt="根据 NyxID 服务目录，推荐几个我还没连接、但对日常工作最有用的服务，说明各自能做什么。">
+                  <i data-lucide="plug"></i>
+                  <span>发现可连接的服务</span>
                   <i data-lucide="arrow-up-right"></i>
                 </button>
               </div>

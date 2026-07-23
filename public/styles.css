@@ -893,6 +893,351 @@ summary:focus-visible {
   height: 13px;
 }
 
+.message-content {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* ── Inline connect card (design/nyxid-assistant-shell.html .connect-card) ── */
+.connect-card {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.cc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--border);
+  padding: 12px 14px;
+}
+
+.cc-brand {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.cc-logo {
+  display: flex;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 8px;
+  background: linear-gradient(145deg, #a672fb, #5a2af1);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.cc-logo img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #fff;
+}
+
+.cc-copy {
+  min-width: 0;
+}
+
+.cc-title {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.cc-sub {
+  margin-top: 1px;
+  overflow: hidden;
+  color: var(--tertiary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cc-pill {
+  border: 1px solid rgba(251, 191, 36, 0.3);
+  border-radius: 999px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  padding: 3px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+
+.cc-pill.ok {
+  border-color: rgba(52, 211, 153, 0.3);
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.cc-pill.bad {
+  border-color: rgba(248, 113, 113, 0.3);
+  background: var(--error-soft);
+  color: var(--error);
+}
+
+.cc-steps {
+  padding: 8px 14px 6px;
+}
+
+.cc-step {
+  display: flex;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.cc-num {
+  position: relative;
+  display: flex;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--tertiary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.cc-step:not(:last-child) .cc-num::after {
+  content: "";
+  position: absolute;
+  top: 24px;
+  left: 50%;
+  width: 1px;
+  height: calc(100% - 4px);
+  background: var(--border);
+  transform: translateX(-50%);
+}
+
+.cc-step.active .cc-num {
+  border-color: transparent;
+  background: linear-gradient(90deg, #a672fb, #5e00f5);
+  color: #fff;
+}
+
+.cc-step.done .cc-num {
+  border-color: transparent;
+  background: var(--success);
+  color: #fff;
+}
+
+.cc-step.done .cc-num::before {
+  content: "";
+  width: 4px;
+  height: 8px;
+  margin-top: -2px;
+  border: solid #fff;
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+}
+
+.cc-step-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.cc-step-title {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.cc-step.active .cc-step-title,
+.cc-step.done .cc-step-title {
+  color: var(--text);
+}
+
+.cc-step-desc {
+  margin-top: 2px;
+  color: var(--tertiary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.cc-action-zone {
+  margin-top: 10px;
+}
+
+.cc-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cc-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  padding: 7px 12px;
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: filter 0.15s, background-color 0.15s, color 0.15s;
+}
+
+.cc-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.cc-btn.primary {
+  background: linear-gradient(90deg, #a672fb 0%, #5e00f5 100%);
+  color: #fff;
+}
+
+.cc-btn.primary:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.cc-btn.ghost {
+  border-color: var(--border-strong);
+  background: none;
+  color: var(--muted);
+}
+
+.cc-btn.ghost:hover:not(:disabled) {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.cc-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.cc-key-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cc-key-form input {
+  min-width: 200px;
+  flex: 1;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg);
+  color: var(--text);
+  padding: 7px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.cc-key-form input:focus {
+  border-color: var(--border-strong);
+  outline: none;
+}
+
+.cc-key-link {
+  display: inline-block;
+  margin-top: 8px;
+  color: var(--info);
+  font-size: 11.5px;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+.cc-hint {
+  margin-top: 8px;
+  color: var(--tertiary);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.cc-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 14px 10px;
+  border: 1px solid rgba(248, 113, 113, 0.25);
+  border-radius: 9px;
+  background: var(--error-soft);
+  color: var(--error);
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.cc-error svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.cc-success {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 8px;
+  color: var(--success);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.cc-success svg {
+  width: 14px;
+  height: 14px;
+}
+
+.cc-foot {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border-top: 1px solid var(--border);
+  color: var(--tertiary);
+  padding: 10px 14px;
+  font-size: 11px;
+}
+
+.cc-foot svg {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+.connect-card.connected .cc-foot {
+  color: var(--muted);
+}
+
+.connect-card-pending {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--muted);
+  padding: 12px 14px;
+  font-size: 12px;
+}
+
+.connect-card-pending svg {
+  width: 14px;
+  height: 14px;
+  animation: spin 1s linear infinite;
+  color: var(--accent);
+}
+
 .authorization-callout {
   display: grid;
   min-height: 58px;
@@ -1026,7 +1371,7 @@ summary:focus-visible {
   margin: 2px 0 14px;
   overflow: hidden;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: 12px;
   background: var(--panel);
 }
 
@@ -1135,9 +1480,9 @@ summary:focus-visible {
 .approval-card {
   margin: 4px 0 14px;
   border: 1px solid rgba(251, 191, 36, 0.35);
-  border-radius: var(--radius);
+  border-radius: 12px;
   background: var(--warning-soft);
-  padding: 13px;
+  padding: 14px 16px;
 }
 
 .approval-header {

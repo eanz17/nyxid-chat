@@ -8,6 +8,12 @@ import {
   redact,
   safeJson,
 } from "./protocol.js";
+import {
+  buildConnectCardBlock,
+  connectCardSteps,
+  connectorInitial,
+  splitMessageSegments,
+} from "./blocks.js";
 
 const PREFERENCES_KEY = "nyxid-chat:production-preferences:v4-site-session";
 const THEME_KEY = "nyxid-chat-demo:theme";
@@ -137,6 +143,7 @@ const state = {
   },
   auth: { authenticated: false, user: null, resources: [] },
   services: [],
+  connectors: { connected: [], available: [], loadedAt: 0 },
   sessionId: createId("session"),
   actorId: null,
   attachment: null,
@@ -179,6 +186,7 @@ function createRunState() {
     approvalCard: null,
     authorizationCards: [],
     authorizationPrompted: false,
+    cardElements: new Map(),
     eventSequence: 0,
     request: null,
   };
@@ -517,10 +525,14 @@ async function refreshAuthSession({ includeServices = false } = {}) {
       : { authenticated: false, user: null, resources: [] };
     state.config.scopeId = payload.scopeId || "";
     if (state.auth.authenticated && includeServices) await loadServices();
-    if (!state.auth.authenticated) state.services = [];
+    if (!state.auth.authenticated) {
+      state.services = [];
+      state.connectors = { connected: [], available: [], loadedAt: 0 };
+    }
   } catch {
     state.auth = { authenticated: false, user: null, resources: [] };
     state.services = [];
+    state.connectors = { connected: [], available: [], loadedAt: 0 };
     state.config.scopeId = "";
   }
   renderAuthUi();
@@ -553,6 +565,378 @@ async function loadServices() {
   }
   renderServiceList();
   refreshAuthorizationCards();
+  void loadConnectors();
+}
+
+async function loadConnectors({ fresh = false } = {}) {
+  if (!state.auth.authenticated) {
+    state.connectors = { connected: [], available: [], loadedAt: 0 };
+    return state.connectors;
+  }
+  try {
+    const response = await fetch(`/api/nyxid/connectors${fresh ? "?fresh=1" : ""}`, {
+      cache: "no-store",
+    });
+    if (!response.ok) throw await responseError(response);
+    const payload = await response.json();
+    state.connectors = {
+      connected: Array.isArray(payload.connected) ? payload.connected : [],
+      available: Array.isArray(payload.available) ? payload.available : [],
+      loadedAt: Date.now(),
+    };
+    updateLiveConnectCards();
+  } catch {
+    // The connector catalog only enriches cards; the chat keeps working without it.
+  }
+  return state.connectors;
+}
+
+const liveConnectCards = new Set();
+
+function createConnectCard(segment, { retry = null, conversation = null } = {}) {
+  const card = {
+    segment,
+    retry,
+    conversation,
+    slug: segment.slug,
+    root: el("section", "connect-card"),
+    block: null,
+    status: "needs_connection",
+    keyInputOpen: false,
+    busy: false,
+    retried: false,
+    error: "",
+    note: "",
+  };
+  card.root.dataset.slug = segment.slug;
+  card.block = buildConnectCardBlock(segment, state.connectors);
+  card.status = card.block.state;
+  renderConnectCard(card);
+  liveConnectCards.add(card);
+  return card;
+}
+
+function connectDeepLink(card) {
+  const base = state.config.nyxidWebUrl || "https://nyx.chrono-ai.fun";
+  if (!card.block.known) return new URL("/keys", base).toString();
+  const url = new URL("/keys", base);
+  url.searchParams.set("slug", card.slug);
+  return url.toString();
+}
+
+function openConnectTarget(card) {
+  const target = connectDeepLink(card);
+  const opened = window.open(target, "nyxid-connect");
+  if (opened) {
+    try {
+      opened.opener = null;
+    } catch {
+      // The NyxID window may already be cross-origin.
+    }
+    opened.focus?.();
+  } else {
+    window.location.assign(target);
+  }
+  card.status = "waiting_for_user";
+  card.note = "在 NyxID 完成连接后，回到这里刷新状态。";
+  renderConnectCard(card);
+}
+
+async function submitConnectCredential(card, credential) {
+  const value = String(credential || "").trim();
+  if (!value) {
+    card.error = "请先粘贴 API key。";
+    renderConnectCard(card);
+    return;
+  }
+  card.busy = true;
+  card.error = "";
+  renderConnectCard(card);
+  try {
+    const response = await fetch("/api/nyxid/keys", {
+      method: "POST",
+      headers: demoHeaders(),
+      body: JSON.stringify({
+        serviceSlug: card.slug,
+        credential: value,
+        label: card.block.service_name,
+      }),
+    });
+    if (!response.ok) throw await responseError(response);
+    card.busy = false;
+    card.keyInputOpen = false;
+    markConnectCardConnected(card);
+    void loadServices();
+  } catch (error) {
+    card.busy = false;
+    card.status = "error";
+    card.error = error.message || "连接失败，请重试。";
+    renderConnectCard(card);
+  }
+}
+
+async function refreshConnectCard(card) {
+  card.busy = true;
+  card.error = "";
+  renderConnectCard(card);
+  await loadConnectors({ fresh: true });
+  if (card.status === "connected") return;
+  card.busy = false;
+  const refreshed = buildConnectCardBlock(card.segment, state.connectors);
+  if (refreshed.state === "connected") {
+    card.block = refreshed;
+    markConnectCardConnected(card);
+    void loadServices();
+    return;
+  }
+  card.block = { ...refreshed, state: card.block.state };
+  card.note = "尚未检测到该服务的连接，完成后再刷新一次。";
+  renderConnectCard(card);
+}
+
+function markConnectCardConnected(card) {
+  card.status = "connected";
+  card.error = "";
+  card.note = "";
+  card.block = {
+    ...card.block,
+    state: "connected",
+    steps: connectCardSteps(card.block.service_name, card.block.auth_kind, true),
+  };
+  renderConnectCard(card);
+  scheduleConnectCardRetry(card);
+}
+
+function scheduleConnectCardRetry(card) {
+  const retry = card.retry;
+  if (card.retried || !retry || (!retry.prompt && !retry.attachment)) return;
+  card.retried = true;
+  setTimeout(() => {
+    const activeConversation = state.activeConversation;
+    if (state.activeController || (card.conversation && card.conversation !== activeConversation)) {
+      card.retried = false;
+      card.note = "服务已连接。当前有运行进行中或会话已切换，请手动重试。";
+      renderConnectCard(card);
+      return;
+    }
+    void sendPrompt(retry.prompt, {
+      attachment: retry.attachment || null,
+      preserveComposer: true,
+    });
+  }, 900);
+}
+
+function updateLiveConnectCards() {
+  for (const card of Array.from(liveConnectCards)) {
+    if (!card.root.isConnected) {
+      liveConnectCards.delete(card);
+      continue;
+    }
+    if (card.status === "connected") continue;
+    const refreshed = buildConnectCardBlock(card.segment, state.connectors);
+    if (refreshed.state === "connected") {
+      card.block = refreshed;
+      markConnectCardConnected(card);
+      continue;
+    }
+    if (card.status === "needs_connection" && !card.keyInputOpen && !card.busy) {
+      card.block = refreshed;
+      renderConnectCard(card);
+    }
+  }
+}
+
+function connectCardPill(card) {
+  const labels = {
+    needs_connection: "未连接",
+    waiting_for_user: "等待连接",
+    connected: "已连接",
+    error: "连接失败",
+  };
+  const modifier = card.status === "connected" ? " ok" : card.status === "error" ? " bad" : "";
+  return el("span", `cc-pill${modifier}`, card.busy ? "处理中…" : labels[card.status] || "未连接");
+}
+
+function renderConnectCard(card) {
+  const block = card.block;
+  card.root.className = `connect-card${card.status === "connected" ? " connected" : ""}`;
+  card.root.replaceChildren();
+
+  const head = el("div", "cc-head");
+  const brand = el("div", "cc-brand");
+  const logo = el("span", "cc-logo");
+  if (/^https:\/\//i.test(block.icon_url || "")) {
+    const image = document.createElement("img");
+    image.src = block.icon_url;
+    image.alt = "";
+    image.loading = "lazy";
+    logo.append(image);
+  } else {
+    logo.textContent = connectorInitial(block.service_name);
+  }
+  const brandCopy = el("div", "cc-copy");
+  brandCopy.append(el("div", "cc-title", block.service_name));
+  const subtitle = card.status === "connected"
+    ? "已通过 NyxID 连接，任务可以继续"
+    : block.subtitle || (block.known ? "连接后 Agent 可通过 NyxID proxy 调用" : "该服务不在 NyxID 目录中，可在 NyxID 里手动添加");
+  brandCopy.append(el("div", "cc-sub", subtitle));
+  brand.append(logo, brandCopy);
+  head.append(brand, connectCardPill(card));
+  card.root.append(head);
+
+  const steps = el("div", "cc-steps");
+  block.steps.forEach((step, index) => {
+    const active = card.status !== "connected" ? index === 0 : index === 2;
+    const row = el("div", `cc-step${step.done ? " done" : active ? " active" : ""}`);
+    row.append(el("span", "cc-num", step.done ? "" : String(index + 1)));
+    const body = el("div", "cc-step-body");
+    body.append(el("div", "cc-step-title", step.title), el("div", "cc-step-desc", step.body));
+    if (index === 0 && card.status !== "connected") body.append(renderConnectCardActions(card));
+    if (index === 2 && card.status === "connected") {
+      const success = el("div", "cc-success");
+      success.append(iconNode("check"), el("span", "", card.retried
+        ? "已连接 — 正在恢复任务…"
+        : card.note || "已连接 — 可以继续了"));
+      body.append(success);
+    }
+    row.append(body);
+    steps.append(row);
+  });
+  card.root.append(steps);
+
+  if (card.error) {
+    const error = el("div", "cc-error");
+    error.append(iconNode("circle-alert"), el("span", "", card.error));
+    card.root.append(error);
+  }
+
+  const foot = el("div", "cc-foot");
+  foot.append(iconNode("shield-check"), el("span", "", block.footer));
+  card.root.append(foot);
+  refreshIcons(card.root);
+}
+
+function renderConnectCardActions(card) {
+  const wrap = el("div", "cc-action-zone");
+  if (card.note && card.status !== "connected") {
+    wrap.append(el("div", "cc-hint", card.note));
+  }
+  const actions = el("div", "cc-actions");
+  const apiKeyFlow = card.block.known && card.block.auth_kind === "api_key";
+
+  if (card.keyInputOpen && apiKeyFlow) {
+    const form = el("form", "cc-key-form");
+    const input = document.createElement("input");
+    input.type = "password";
+    input.placeholder = `粘贴 ${card.block.service_name} API key`;
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.disabled = card.busy;
+    const submit = el("button", "cc-btn primary", card.busy ? "正在连接…" : "保存并连接");
+    submit.type = "submit";
+    submit.disabled = card.busy;
+    const cancel = el("button", "cc-btn ghost", "取消");
+    cancel.type = "button";
+    cancel.disabled = card.busy;
+    cancel.addEventListener("click", () => {
+      card.keyInputOpen = false;
+      card.error = "";
+      renderConnectCard(card);
+    });
+    form.append(input, submit, cancel);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void submitConnectCredential(card, input.value);
+    });
+    wrap.append(form);
+    if (card.block.api_key_url) {
+      const link = document.createElement("a");
+      link.className = "cc-key-link";
+      link.href = card.block.api_key_url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = `获取 ${card.block.service_name} API key ↗`;
+      wrap.append(link);
+    }
+    if (card.block.api_key_instructions) {
+      wrap.append(el("div", "cc-hint", card.block.api_key_instructions.slice(0, 240)));
+    }
+    queueMicrotask(() => input.focus());
+    return wrap;
+  }
+
+  if (apiKeyFlow) {
+    const paste = el("button", "cc-btn primary", "");
+    paste.type = "button";
+    paste.append(iconNode("key-round"), el("span", "", `粘贴 API key 连接`));
+    paste.disabled = card.busy;
+    paste.addEventListener("click", () => {
+      card.keyInputOpen = true;
+      card.error = "";
+      renderConnectCard(card);
+    });
+    actions.append(paste);
+    const external = el("button", "cc-btn ghost", "");
+    external.type = "button";
+    external.append(iconNode("arrow-up-right"), el("span", "", "在 NyxID 中连接"));
+    external.disabled = card.busy;
+    external.addEventListener("click", () => openConnectTarget(card));
+    actions.append(external);
+  } else {
+    const connect = el("button", "cc-btn primary", "");
+    connect.type = "button";
+    connect.append(
+      iconNode("arrow-up-right"),
+      el("span", "", card.status === "waiting_for_user"
+        ? "重新打开 NyxID"
+        : `在 NyxID 中连接 ${card.block.service_name}`),
+    );
+    connect.disabled = card.busy;
+    connect.addEventListener("click", () => openConnectTarget(card));
+    actions.append(connect);
+  }
+
+  const refresh = el("button", "cc-btn ghost", "");
+  refresh.type = "button";
+  refresh.append(iconNode(card.busy ? "loader-circle" : "refresh-cw"), el("span", "", card.busy ? "正在检查…" : "我已连接，刷新状态"));
+  refresh.disabled = card.busy;
+  refresh.addEventListener("click", () => void refreshConnectCard(card));
+  actions.append(refresh);
+
+  wrap.append(actions);
+  return wrap;
+}
+
+function createPendingCardPlaceholder() {
+  const pending = el("div", "connect-card-pending");
+  pending.append(iconNode("loader-circle"), el("span", "", "正在准备连接卡片…"));
+  return pending;
+}
+
+function renderAssistantSegments(container, source, cardRegistry, {
+  streaming = false,
+  retry = null,
+  conversation = null,
+} = {}) {
+  const segments = splitMessageSegments(source, { allowPartial: streaming });
+  container.replaceChildren();
+  for (const segment of segments) {
+    if (segment.kind === "text") {
+      const textElement = el("div", "message-text markdown-body");
+      renderMarkdown(textElement, segment.text);
+      container.append(textElement);
+    } else if (segment.kind === "connect_card") {
+      let card = cardRegistry.get(segment.key);
+      if (!card) {
+        card = createConnectCard(segment, { retry, conversation });
+        cardRegistry.set(segment.key, card);
+      }
+      container.append(card.root);
+    } else if (segment.kind === "pending_card") {
+      container.append(createPendingCardPlaceholder());
+    }
+  }
+  refreshIcons(container);
 }
 
 function renderAuthUi() {
@@ -697,6 +1081,7 @@ async function logout() {
     dom.logoutButton.disabled = false;
     state.auth = { authenticated: false, user: null, resources: [] };
     state.services = [];
+    state.connectors = { connected: [], available: [], loadedAt: 0 };
     state.config.scopeId = "";
     state.health = null;
     closeSettings();
@@ -1130,10 +1515,15 @@ function renderStoredMessage(message) {
   const role = message.role === "user" ? "user" : "assistant";
   const { body } = createMessageShell(role);
   if (message.content) {
-    const content = el("div", `message-text${role === "assistant" ? " markdown-body" : ""}`);
-    if (role === "assistant") renderMarkdown(content, message.content);
-    else content.textContent = message.content;
-    body.append(content);
+    if (role === "assistant") {
+      const content = el("div", "message-content");
+      renderAssistantSegments(content, message.content, new Map(), { streaming: false });
+      body.append(content);
+    } else {
+      const content = el("div", "message-text");
+      content.textContent = message.content;
+      body.append(content);
+    }
   }
   if (message.error) {
     const callout = el("div", "error-callout");
@@ -1547,7 +1937,7 @@ function ensureActivityCard() {
   const header = el("div", "activity-header");
   const icon = document.createElement("i");
   icon.dataset.lucide = "workflow";
-  const label = el("span", "", "Execution");
+  const label = el("span", "", "Run");
   const status = el("span", "", "Running");
   header.append(icon, label, status);
   card.append(header);
@@ -1646,12 +2036,22 @@ function addTool(event) {
     duration,
   });
   startStep(name, "tool", id);
+  updateActivityProgress();
   if (/ornn_search_skills|use_skill/i.test(name)) {
     dom.routeOrnnState.textContent = "active";
     dom.routeOrnnState.className = "route-state active";
   }
   refreshIcons(row);
   scrollThread();
+}
+
+function updateActivityProgress() {
+  if (!state.run.activityStatus?.isConnected) return;
+  const tools = Array.from(state.run.tools.values());
+  if (!tools.length) return;
+  const done = tools.filter((tool) => tool.status !== "running").length;
+  state.run.activityStatus.textContent =
+    `${done} / ${tools.length} steps${done === tools.length ? " · complete" : ""}`;
 }
 
 function finishTool(event) {
@@ -1682,6 +2082,7 @@ function finishTool(event) {
     });
   }
   resolved.duration.textContent = formatDuration(resolved.completedAt - resolved.startedAt);
+  updateActivityProgress();
   finishStep(resolved.name, "tool", resolved.status, resolved.id);
   if (/ornn_search_skills|use_skill/i.test(resolved.name)) {
     applyHealthRouteState();
@@ -1720,6 +2121,7 @@ function findServiceAuthorizationFailure(value) {
 }
 
 function finalizeRunningExecution(status, detail) {
+  finalizeAssistantSegments();
   const completedAt = Date.now();
   for (const tool of state.run.tools.values()) {
     if (tool.status !== "running") continue;
@@ -1741,7 +2143,8 @@ function finalizeRunningExecution(status, detail) {
     step.completedAt = completedAt;
   }
   if (state.run.activityStatus) {
-    state.run.activityStatus.textContent = status === "done" ? "Complete" : "Ended";
+    if (state.run.tools.size) updateActivityProgress();
+    else state.run.activityStatus.textContent = status === "done" ? "Complete" : "Ended";
   }
   applyHealthRouteState();
 }
@@ -1837,24 +2240,43 @@ function finishStep(name, kind, status = "done", explicitId) {
 
 function startText() {
   if (state.run.textElement?.isConnected) return;
-  state.run.textElement = el("div", "message-text markdown-body", "");
+  state.run.textElement = el("div", "message-content", "");
   ensureAssistantBody().append(state.run.textElement);
   scrollThread();
+}
+
+function assistantSegmentOptions() {
+  return {
+    retry: state.run.request,
+    conversation: conversationContext || state.activeConversation,
+  };
 }
 
 function appendText(delta) {
   if (!delta) return;
   startText();
   state.run.assistantText += String(delta);
-  renderMarkdown(state.run.textElement, state.run.assistantText);
+  renderAssistantSegments(state.run.textElement, state.run.assistantText, state.run.cardElements, {
+    streaming: true,
+    ...assistantSegmentOptions(),
+  });
   scrollThread();
 }
 
 function finishText() {
-  if (state.run.textElement && !state.run.assistantText.trim()) {
+  finalizeAssistantSegments();
+  if (state.run.textElement && !state.run.assistantText.trim() && !state.run.cardElements.size) {
     state.run.textElement.remove();
     state.run.textElement = null;
   }
+}
+
+function finalizeAssistantSegments() {
+  if (!state.run.textElement?.isConnected) return;
+  renderAssistantSegments(state.run.textElement, state.run.assistantText, state.run.cardElements, {
+    streaming: false,
+    ...assistantSegmentOptions(),
+  });
 }
 
 function renderMarkdown(target, source) {
@@ -2044,6 +2466,7 @@ function addServiceAuthorizationPrompt(message, {
   resource = "",
   retry = null,
 } = {}) {
+  if (!login && addConnectCardForMissingService(message, serviceSlug, retry)) return;
   const service = findNyxidService({ serviceId, serviceSlug, resource });
   const card = {
     root: el("div", "authorization-callout"),
@@ -2062,6 +2485,28 @@ function addServiceAuthorizationPrompt(message, {
   ensureAssistantBody().append(card.root);
   renderServiceAuthorizationCard(card);
   scrollThread();
+}
+
+function addConnectCardForMissingService(message, serviceSlug, retry) {
+  const slug = String(serviceSlug || "").trim().toLowerCase();
+  if (!slug) return false;
+  const available = state.connectors.available.find((service) => service.slug === slug);
+  if (!available) return false;
+  const segment = {
+    kind: "connect_card",
+    key: createId(`connect-${slug}`),
+    slug,
+    reason: String(message || "").replace(/\s+/g, " ").trim().slice(0, 200),
+    requestedScopes: [],
+  };
+  const card = createConnectCard(segment, {
+    retry,
+    conversation: conversationContext || state.activeConversation,
+  });
+  state.run.cardElements.set(segment.key, card);
+  ensureAssistantBody().append(card.root);
+  scrollThread();
+  return true;
 }
 
 function renderServiceAuthorizationCard(card) {
